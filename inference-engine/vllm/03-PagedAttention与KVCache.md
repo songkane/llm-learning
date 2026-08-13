@@ -1,6 +1,6 @@
 # 03 · PagedAttention 与 KV Cache 管理 —— vLLM 的招牌技术
 
-> 承接 02。02 里反复出现的 `allocate_slots`（申请显存）、「前缀缓存命中」到底怎么实现？本文讲透 vLLM 最核心的创新：像操作系统分页一样管理 KV 显存。
+> 承接 [02](02-调度器-连续批处理.md)。[02](02-调度器-连续批处理.md) 里反复出现的 `allocate_slots`（申请显存）、「前缀缓存命中」到底怎么实现？本文讲透 vLLM 最核心的创新：像操作系统分页一样管理 KV 显存。
 > 注释分两类：`【逻辑】`讲原理；`【Python】`讲语法。
 > 对应源码：`vllm/v1/core/kv_cache_manager.py`、`block_pool.py`、`kv_cache_utils.py`。
 
@@ -51,11 +51,11 @@ vLLM 把这套搬到 KV Cache：
 - **`BlockPool`**：物理块的总仓库，管理谁空闲谁占用。
 - **`KVCacheManager`**：对上层（调度器）的门面，`allocate_slots`（申请）、`free`（释放）都在这。
 
-> 本篇沿用 `00` 篇的统一示例（A/B 两请求，共享 40-token 的 system prompt）。
+> 本篇沿用 [`00` 篇](00-全局架构与数据流总览.md)的统一示例（A/B 两请求，共享 40-token 的 system prompt）。
 
 ### 0.4 `allocate_slots` + 前缀缓存 内部流程图 ★
 
-02 篇每次调 `allocate_slots` 时，内部发生的事：
+[02 篇](02-调度器-连续批处理.md)每次调 `allocate_slots` 时，内部发生的事：
 
 ```
 调度器调用 allocate_slots(request, num_new_tokens)
@@ -127,7 +127,7 @@ class KVCacheBlock:
 
 【Python 重点 —— `@dataclass`】
 
-- `@dataclass` 是一个**装饰器**（回顾 02：装饰器就是加在类/函数上以 `@` 开头的修饰符，给它附加行为）。
+- `@dataclass` 是一个**装饰器**（回顾 [02](02-调度器-连续批处理.md)：装饰器就是加在类/函数上以 `@` 开头的修饰符，给它附加行为）。
 - 加了 `@dataclass`，Python 会**自动帮你生成 `__init__` 构造函数**等样板代码。也就是说，你只需像上面这样列出字段名和类型，就能 `KVCacheBlock(block_id=5)` 这样创建对象，不用手写 `def __init__(self, block_id, ...)`。
 - `ref_cnt: int = 0` :字段带默认值，创建时不传就用 0。
 - `_block_hash: ... = None` :`_` 开头表示「内部字段」，外部应通过下面的 `@property` 访问。
@@ -156,6 +156,7 @@ class KVCacheBlock:
 
 ---
 
+<a id="sec-2"></a>
 ## 2. 空闲块的组织：`FreeKVCacheBlockQueue`（散落的关键实现）
 
 文件：`vllm/v1/core/kv_cache_utils.py`（第 184 行）
@@ -293,7 +294,7 @@ class FreeKVCacheBlockQueue:
 ```
 
 【逻辑】前缀缓存命中时：某个空闲块（`ref_cnt=0`）里正好缓存着新请求需要的前缀 KV。此时不能让它被逐出，于是：
-1. 若它还躺在空闲链表里（`ref_cnt==0`），用 `remove` **从链表中间 O(1) 摘出来**（这就是 §2 自造链表的意义！）。
+1. 若它还躺在空闲链表里（`ref_cnt==0`），用 `remove` **从链表中间 O(1) 摘出来**（这就是 [§2](#sec-2) 自造链表的意义！）。
 2. `ref_cnt += 1`，标记被新请求引用。
 
 `get_new_blocks`（拿新块装新数据）和 `touch`（复用旧块的缓存内容）是一对反向操作，共同实现「按需分配 + 前缀复用」。
@@ -350,11 +351,11 @@ class FreeKVCacheBlockQueue:
             return None
 ```
 
-【逻辑 —— 这是 02 抢占逻辑的源头】
+【逻辑 —— 这是 [02](02-调度器-连续批处理.md) 抢占逻辑的源头】
 
 - 算出「这个请求总共要占多少 token 的槽位」→ 换算成「要多少块」`num_blocks_to_allocate`。
 - 对比「可用块数」。**不够就 `return None`**。
-- 回顾 02：调度器拿到 `None`，对 running 请求就触发抢占、对 waiting 请求就停止放行。**所有显存压力的决策，源头都是这里的这个 `return None`。**
+- 回顾 [02](02-调度器-连续批处理.md)：调度器拿到 `None`，对 running 请求就触发抢占、对 waiting 请求就停止放行。**所有显存压力的决策，源头都是这里的这个 `return None`。**
 - `watermark_blocks`（水位线）：给等待/被抢占的请求留一点余量块，避免刚放进来又立刻卡死，是个稳定性设计。
 
 ### 4.3 真正分配 + 缓存
@@ -426,7 +427,7 @@ def hash_block_tokens(
 
 ### 5.1 统一示例：A/B 两请求的 block 分配与共享全过程 ★
 
-现在把 00/02 篇的例子在块层面走一遍，看物理块和 `ref_cnt` 怎么变化。
+现在把 [00](00-全局架构与数据流总览.md)/[02](02-调度器-连续批处理.md) 篇的例子在块层面走一遍，看物理块和 `ref_cnt` 怎么变化。
 约定：`block_size=16`，SYS=40 token（占满 2 个块 + 半个），A prompt=48，B prompt=50。
 
 **T0 —— A 到达，做 prefill：**
@@ -489,7 +490,7 @@ free(A) 后：
 
 ## 6. 释放：`free`
 
-请求结束时（02 的 `update_from_output` 判定结束后），归还它的块：
+请求结束时（[02](02-调度器-连续批处理.md) 的 `update_from_output` 判定结束后），归还它的块：
 
 ```python
     def free(self, request: Request) -> None:
@@ -556,6 +557,6 @@ allocate_slots(请求, 新token数)          KVCacheManager
 
 ## 下一步
 
-- **04 · Worker 与模型执行**：`SchedulerOutput`（含每个请求分到的 block 列表）交给 GPU 后，`gpu_model_runner` 如何把变长请求打平成张量、`execute_model` 里 attention kernel 如何用 block table 做分页注意力。这是整条链路的最后一环——真正的 GPU 计算。
+- **[04](04-Worker与模型执行.md) · Worker 与模型执行**：`SchedulerOutput`（含每个请求分到的 block 列表）交给 GPU 后，`gpu_model_runner` 如何把变长请求打平成张量、`execute_model` 里 attention kernel 如何用 block table 做分页注意力。这是整条链路的最后一环——真正的 GPU 计算。
 
 我将继续生成 04。
