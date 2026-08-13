@@ -411,15 +411,17 @@ print("⑦ 采样出的 next_token id:", next_token)
 
 把上面 7 步和真实代码一一对上，你就打通了「数学」和「工程」：
 
-| demo 步骤 | 干的事 | vLLM 里对应 |
-|---|---|---|
-| ① embedding | id → 向量 | `self.model(...)` 内部第一步（模型的 `embed_tokens`） |
-| ② Q/K/V 投影 | 线性变换 | 模型每层 attention 的 `qkv_proj` |
-| ③④ 注意力 | scores→softmax→加权 | §5.2 的 `flash_attn_varlen_func`（GPU 上高度优化的同一套数学） |
-| ⑤ FFN | 非线性变换 | 模型每层的 MLP |
-| （重复 N 层） | 叠加表达能力 | Llama 的 32 层 `decoder_layers` |
-| ⑥ compute_logits | hidden→词表分数 | §4 的 `self.model.compute_logits`（`lm_head`） |
-| ⑦ argmax | 挑 token | §6 的 `sample_tokens`（这里是 temperature=0 贪心） |
+| demo 步骤 | 干的事 | 代码路径（vLLM 源码） | vLLM 里对应 |
+|---|---|---|---|
+| ① embedding | id → 向量 | `vllm/model_executor/models/llama.py:377`（`embed_tokens`） | `self.model(...)` 内部第一步（模型的 `embed_tokens`） |
+| ② Q/K/V 投影 | 线性变换 | `vllm/model_executor/models/llama.py:163`（`qkv_proj`） | 模型每层 attention 的 `qkv_proj` |
+| ③④ 注意力 | scores→softmax→加权 | `vllm/v1/attention/backends/flash_attn.py:1200`（`flash_attn_varlen_func`） | §5.2 的 `flash_attn_varlen_func`（GPU 上高度优化的同一套数学） |
+| ⑤ FFN | 非线性变换 | `vllm/model_executor/models/llama.py:80`（`LlamaMLP`） | 模型每层的 MLP |
+| （重复 N 层） | 叠加表达能力 | `vllm/model_executor/models/llama.py:249,384`（`LlamaDecoderLayer` / `self.layers`） | Llama 的 32 层 `decoder_layers` |
+| ⑥ compute_logits | hidden→词表分数 | `vllm/model_executor/models/llama.py:529`（`compute_logits`） | §4 的 `self.model.compute_logits`（`lm_head`） |
+| ⑦ argmax | 挑 token | `vllm/v1/worker/gpu_model_runner.py:4638`（`sample_tokens`）→ `vllm/v1/sample/sampler.py` | §6 的 `sample_tokens`（这里是 temperature=0 贪心） |
+
+> 行号基于当前源码版本，随版本可能微调；按符号名（`embed_tokens`/`qkv_proj`/`LlamaMLP` 等）搜索更稳。
 
 ### 4.5.4 从 demo 到真实 vLLM：三个关键差异
 
