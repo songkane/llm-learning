@@ -433,6 +433,102 @@ demo 把结构讲清了，但真实 vLLM 为了「快」和「省显存」，在
 
 > 一句话：**demo 展示的是「数学骨架」，vLLM 干的是「让这套骨架在 GPU 上又快又省地跑大 batch」**。你看懂了骨架，再回头看 §2~§7 的每个优化，就知道它们各自在优化骨架的哪一处。
 
+### 4.5.5 真实运行流程：同一套骨架的 vLLM 版核心代码
+
+前面 demo 用 numpy 讲清了「数学长什么样」。这一节把**同样的 7 步**换成 vLLM 真实源码（PyTorch + CUDA kernel）过一遍——**结构和 demo 一一对应，只是每一步都换成了工程化实现**。全部是 `llama.py` / `flash_attn.py` 里的真实核心逻辑（省略了初始化、并行、量化等旁支，只留主干）。
+
+> 数据类型换了：demo 的 `np.ndarray` 在 CPU，真实的 `torch.Tensor` 在 GPU 显存；每个 `@` 矩阵乘底层是 GPU 的 cuBLAS / CUDA kernel。逻辑不变，只是跑在 GPU 上。
+
+#### 顶层：`LlamaModel.forward` —— 对应 demo 的「① embedding + 循环 N 层 + 收尾」
+
+```python
+# vllm/model_executor/models/llama.py  LlamaModel.forward
+def forward(self, input_ids, positions, ...):
+    hidden_states = self.embed_input_ids(input_ids)   # ← demo ①：id → 向量
+    residual = None
+    for layer in self.layers:                         # ← demo「重复 N 层」：Llama 32 层
+        hidden_states, residual = layer(positions, hidden_states, residual)
+    hidden_states, _ = self.norm(hidden_states, residual)  # 最后一层归一化
+    return hidden_states                              # ← 这就是 _model_forward 的输出
+```
+
+对比：demo 里 embedding 是 `embed_table[input_ids]` 一次花式索引；真实是 `self.embed_tokens`（一个 `VocabParallelEmbedding`，权重在 GPU 上、词表还能按 TP 切分）。demo 只跑 1 层，真实用 `for layer in self.layers` 跑满 32 层。
+
+#### 一层内部：`LlamaDecoderLayer.forward` —— 对应 demo 的「②③④ 注意力 + ⑤ FFN」
+
+```python
+# vllm/model_executor/models/llama.py  LlamaDecoderLayer.forward
+def forward(self, positions, hidden_states, residual):
+    # —— 注意力子层（对应 demo ②③④，含残差）——
+    hidden_states, residual = self.input_layernorm(hidden_states, residual)
+    hidden_states = self.self_attn(positions, hidden_states)   # 见下
+
+    # —— FFN 子层（对应 demo ⑤，含残差）——
+    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    hidden_states = self.mlp(hidden_states)                    # 见下
+    return hidden_states, residual
+```
+
+比 demo 多了 `input_layernorm` / `post_attention_layernorm`（RMSNorm，Llama 的稳定化步骤，demo 为简化省了），残差连接 demo 里是 `x = x + ...`，真实里由 norm 函数一并处理。
+
+#### 注意力：`LlamaAttention.forward` —— 对应 demo ②（QKV 投影）+ ③④（缩放点积注意力）
+
+```python
+# vllm/model_executor/models/llama.py  LlamaAttention.forward
+def forward(self, positions, hidden_states):
+    qkv, _ = self.qkv_proj(hidden_states)                 # ← demo ②：一次投影出 QKV(合并权重)
+    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    q, k = self.rotary_emb(positions, q, k)               # 旋转位置编码(demo 省略)
+    attn_output = self.attn(q, k, v)                      # ← demo ③④：走 flash-attn kernel
+    output, _ = self.o_proj(attn_output)                  # ← demo ④的输出投影 Wo
+    return output
+```
+
+关键差异全在这一行 `self.attn(q, k, v)`：demo 里 `③④` 是 `scores→mask→softmax→@V` 四步分开的 numpy；真实里它们被**融合进一个 CUDA kernel**（`flash_attn_varlen_func`，见 §5.2），既不落地中间的分数矩阵、又顺带读写分页 KV Cache（§5.1 的 `slot_mapping`/`block_table`）。QKV 也从 demo 的三个独立矩阵合并成一个 `qkv_proj`（少一次 kernel 启动）。
+
+#### FFN：`LlamaMLP.forward` —— 对应 demo ⑤
+
+```python
+# vllm/model_executor/models/llama.py  LlamaMLP.forward
+def forward(self, x):
+    x, _ = self.gate_up_proj(x)   # 升维(gate、up 两个投影合并成一次)
+    x = self.act_fn(x)            # SiluAndMul 激活(demo 用的是 ReLU 简化)
+    x, _ = self.down_proj(x)      # 降回原维度
+    return x
+```
+
+结构和 demo ⑤完全一致（升维→激活→降维），只是激活函数是 Llama 用的 **SwiGLU（`SiluAndMul`）** 而非 demo 的 ReLU，且 gate/up 两个投影合并成一次矩阵乘。
+
+#### 收尾：`compute_logits` + 采样 —— 对应 demo ⑥⑦
+
+```python
+# vllm/model_executor/models/llama.py  LlamaForCausalLM.compute_logits
+def compute_logits(self, hidden_states):
+    logits = self.logits_processor(self.lm_head, hidden_states)  # ← demo ⑥：hidden → 词表分数
+    return logits
+
+# vllm/v1/worker/gpu_model_runner.py  → vllm/v1/sample/sampler.py
+# ← demo ⑦：temperature=0 时就是 argmax 贪心，否则按概率采样
+```
+
+`lm_head` 就是 demo ⑥里的 `[d_model, vocab]` 投影矩阵；采样 demo 里是一行 `np.argmax`，真实里在 `sampler.py` 里处理 temperature / top-p / top-k 等各种采样策略（temperature=0 时退化成 argmax，和 demo 一致）。
+
+#### 一句话总结这两节
+
+demo（§4.5.2）和真实代码（§4.5.5）**是同一套流程的两个视角**：
+
+| | demo（讲原理） | 真实 vLLM（跑生产） |
+|---|---|---|
+| 写在哪 | 一段 numpy | `llama.py` + `flash_attn.py` + `sampler.py` |
+| 数据 | `np.ndarray`（CPU） | `torch.Tensor`（GPU 显存） |
+| 矩阵乘 | numpy `@`（CPU 单核） | cuBLAS / CUDA kernel（GPU 并行） |
+| 注意力 | 4 步分开的 numpy | `flash_attn_varlen_func` 融合 kernel |
+| 层数 | 1 层 | `for layer in self.layers` 跑 32 层 |
+| 归一化/位置编码 | 省略 | RMSNorm、RoPE |
+| 激活 | ReLU | SwiGLU（SiluAndMul） |
+
+**看懂 demo 的数学骨架，再看真实代码，你会发现每个函数名都能对回 demo 的某一步——只是每一步都被 vLLM 换成了「在 GPU 上又快又省」的工程实现。**
+
 ---
 
 ## 5. attention kernel 如何用 block_table —— 分页注意力落地
