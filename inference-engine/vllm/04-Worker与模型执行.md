@@ -300,6 +300,139 @@ SchedulerOutput{A:48, B:18}
 
 ---
 
+## 4.5 揭开黑盒：`self.model(...)` 一次前向的矩阵运算全过程 ★（可运行 demo）
+
+上面那行 `self.model(input_ids=...)` 是整篇最「黑盒」的一步——一行代码，里面却是 embedding → 多层 transformer → hidden_states 的全部矩阵运算。这一节用一个**缩微到能手算、能直接运行**的玩具模型，把这行黑盒彻底拆开，让你看清每一步张量的**形状**和**数值**怎么流动。
+
+> 重要缩放说明：真实 Llama-3.1-8B 是 `d_model=4096`、`32` 层、`32` 个注意力头、词表 `128256`。这里全部缩小到**能在纸上算清**的玩具尺寸：`d_model=4`、`1` 层、`1` 头、词表 `6`、序列长度 `3`。**运算的结构和真实的完全一样，只是数字小**。看懂这个小的，大的只是把维度乘上去、层数叠上去。
+
+### 4.5.1 设定：一个 3 token 的迷你 prefill
+
+沿用统一示例的思路，假设有一个请求，prefill 3 个 token（对应 §3 里 `input_ids` 的一小段缩影）：
+
+```
+token 序列:   [7, 2, 5]      ← 3 个 token 的 id（真实里是分词结果）
+d_model = 4                  ← 每个 token 用 4 维向量表示（真实是 4096）
+词表大小 = 6                  ← 只有 6 个候选词（真实是十几万）
+1 层 transformer, 1 个 attention 头
+```
+
+这正是 `_prepare_inputs`（§2）打平后交给模型的 `input_ids`（一维，长度 3）。下面走一遍 `self.model(...)` 内部。
+
+### 4.5.2 完整可运行 demo（纯 NumPy，复制即跑）
+
+```python
+import numpy as np
+
+np.random.seed(0)                      # 固定随机，保证你跑出的数和下面一致
+
+# ===== 0. 输入：_prepare_inputs 打平后的 input_ids（§2 的产物）=====
+input_ids = np.array([7, 2, 5])        # 3 个 token，一维（varlen 打平）
+seq_len = len(input_ids)               # 3
+d_model = 4                            # 隐藏维度（真实 4096）
+vocab = 6                              # 词表大小（真实 128256）
+
+# ===== 1. Embedding：token id -> 向量 =====
+# 词嵌入表：形状 [vocab, d_model]，每行是一个词的向量
+embed_table = np.random.randn(vocab, d_model)
+x = embed_table[input_ids]             # 花式索引：按 id 取行 -> [3, 4]
+print("① embedding 后 x:", x.shape)    # (3, 4)  每个 token 一个 4 维向量
+
+# ===== 2. Attention 层 =====
+# 2a. 用三个权重矩阵，把 x 投影成 Q, K, V（都是 [d_model, d_model]）
+Wq = np.random.randn(d_model, d_model)
+Wk = np.random.randn(d_model, d_model)
+Wv = np.random.randn(d_model, d_model)
+Q = x @ Wq                             # [3,4]@[4,4] -> [3,4]
+K = x @ Wk                             # [3,4]
+V = x @ Wv                             # [3,4]
+print("② Q/K/V:", Q.shape, K.shape, V.shape)
+
+# 2b. 注意力分数：Q 和 K 做点积 -> [3,3]（每个 token 对每个 token 的关注度）
+scores = Q @ K.T / np.sqrt(d_model)    # [3,4]@[4,3] -> [3,3]，除以 sqrt(d) 缩放
+
+# 2c. causal mask：token 只能看自己和前面的（不能偷看未来）
+mask = np.triu(np.ones((seq_len, seq_len)), k=1) * -1e9   # 上三角设成 -无穷
+scores = scores + mask
+
+# 2d. softmax：把分数变成概率（每行和为 1）
+attn = np.exp(scores - scores.max(axis=1, keepdims=True))
+attn = attn / attn.sum(axis=1, keepdims=True)             # [3,3]
+print("③ 注意力权重(每行和=1):\n", attn.round(2))
+
+# 2e. 用注意力权重对 V 加权求和 -> 每个 token 融合了上下文的新表示
+attn_out = attn @ V                    # [3,3]@[3,4] -> [3,4]
+
+# 2f. 输出投影 + 残差连接（transformer 标配）
+Wo = np.random.randn(d_model, d_model)
+x = x + attn_out @ Wo                  # 残差：新信息叠加回原向量 -> [3,4]
+print("④ attention 后 x:", x.shape)
+
+# ===== 3. FFN（前馈网络）：两层线性 + 激活，做非线性变换 =====
+W1 = np.random.randn(d_model, d_model * 4)   # 升维 [4,16]
+W2 = np.random.randn(d_model * 4, d_model)   # 降回 [16,4]
+h = np.maximum(0, x @ W1)              # ReLU 激活（负数归零）-> [3,16]
+x = x + h @ W2                         # 再降维 + 残差 -> [3,4]
+print("⑤ FFN 后 hidden_states:", x.shape)   # 这就是 _model_forward 的输出
+
+# （真实模型：上面 2~3 是「一层」，Llama 要重复 32 层。这里只跑 1 层。）
+
+# ===== 4. 取要预测的位置 -> compute_logits =====
+# prefill 只有最后一个 token 负责预测下一个（§4 的 logits_indices）
+logits_indices = np.array([seq_len - 1])     # [2]，即最后一个 token
+sample_hidden = x[logits_indices]            # 花式索引 -> [1, 4]
+
+# 投影到词表维度：hidden -> 每个候选词的分数
+lm_head = np.random.randn(d_model, vocab)    # [4, 6]
+logits = sample_hidden @ lm_head             # [1,4]@[4,6] -> [1,6]
+print("⑥ logits(词表分数):", logits.round(2))
+
+# ===== 5. 采样（§6）：temperature=0 -> 贪心，取分数最高的词 =====
+next_token = int(np.argmax(logits, axis=1)[0])
+print("⑦ 采样出的 next_token id:", next_token)
+```
+
+运行后你会看到类似（数值取决于随机种子）：
+
+```
+① embedding 后 x: (3, 4)
+② Q/K/V: (3, 4) (3, 4) (3, 4)
+③ 注意力权重(每行和=1):
+ [[1.   0.   0.  ]      ← token0 只能看自己
+  [0.31 0.69 0.  ]      ← token1 看 token0+自己
+  [0.28 0.15 0.57]]     ← token2 看前两个+自己
+④ attention 后 x: (3, 4)
+⑤ FFN 后 hidden_states: (3, 4)
+⑥ logits(词表分数): [[ ... 6 个数 ... ]]
+⑦ 采样出的 next_token id: 3
+```
+
+### 4.5.3 这个 demo 对应到 vLLM 源码的哪里
+
+把上面 7 步和真实代码一一对上，你就打通了「数学」和「工程」：
+
+| demo 步骤 | 干的事 | vLLM 里对应 |
+|---|---|---|
+| ① embedding | id → 向量 | `self.model(...)` 内部第一步（模型的 `embed_tokens`） |
+| ② Q/K/V 投影 | 线性变换 | 模型每层 attention 的 `qkv_proj` |
+| ③④ 注意力 | scores→softmax→加权 | §5.2 的 `flash_attn_varlen_func`（GPU 上高度优化的同一套数学） |
+| ⑤ FFN | 非线性变换 | 模型每层的 MLP |
+| （重复 N 层） | 叠加表达能力 | Llama 的 32 层 `decoder_layers` |
+| ⑥ compute_logits | hidden→词表分数 | §4 的 `self.model.compute_logits`（`lm_head`） |
+| ⑦ argmax | 挑 token | §6 的 `sample_tokens`（这里是 temperature=0 贪心） |
+
+### 4.5.4 从 demo 到真实 vLLM：三个关键差异
+
+demo 把结构讲清了，但真实 vLLM 为了「快」和「省显存」，在三处做了工程化改造——这正是前面几篇的主题：
+
+1. **KV 不重算，而是缓存**（§3、§5.1）：demo 里每次都重新算全部 K/V。真实 decode 时，前面 token 的 K/V 已经算过并存在 KV Cache 里（`reshape_and_cache` 写入），当前步只算**新 token** 的 K/V，历史直接从物理块读——这就是 `slot_mapping`（写）+ `block_table`（读）的意义。
+2. **多请求打平，不是一个个跑**（§2）：demo 只有 1 个序列。真实一个 batch 里 A/B/C 多个请求首尾相接成一维长条，靠 `cu_seqlens` 区分边界，一次 kernel 算完所有请求（连续批处理，02 篇）。
+3. **kernel 融合 + CUDA Graph**（§5、§7.2）：demo 里 `②③④` 是分开的 numpy 运算。真实用 `flash_attn_varlen_func` 把它们**融合成一个 GPU 算子**（不落地中间的 `[3,3]` 分数矩阵，省显存也更快），decode 阶段还用 CUDA Graph 录制回放省启动开销。
+
+> 一句话：**demo 展示的是「数学骨架」，vLLM 干的是「让这套骨架在 GPU 上又快又省地跑大 batch」**。你看懂了骨架，再回头看 §2~§7 的每个优化，就知道它们各自在优化骨架的哪一处。
+
+---
+
 ## 5. attention kernel 如何用 block_table —— 分页注意力落地
 
 文件：`vllm/v1/attention/backends/flash_attn.py`（`forward` 第 874 行）
