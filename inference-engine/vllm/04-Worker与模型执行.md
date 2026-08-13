@@ -1,6 +1,6 @@
 # 04 · Worker 与模型执行 —— GPU 上到底发生了什么
 
-> 承接 02、03。调度器产出的 `SchedulerOutput`（含每个请求的 token 数、分到的 block）交给 GPU 后，`execute_model` 里发生了什么？本文讲最后一环：变长请求如何打平成张量、模型如何前向、attention kernel 如何用 block table 做分页注意力、采样如何产出 token。
+> 承接 [02](02-调度器-连续批处理.md)、[03](03-PagedAttention与KVCache.md)。调度器产出的 `SchedulerOutput`（含每个请求的 token 数、分到的 block）交给 GPU 后，`execute_model` 里发生了什么？本文讲最后一环：变长请求如何打平成张量、模型如何前向、attention kernel 如何用 block table 做分页注意力、采样如何产出 token。
 > 注释分两类：`【逻辑】`讲原理；`【Python/PyTorch】`讲语法。
 > 对应源码：`vllm/v1/worker/gpu_model_runner.py`、`vllm/v1/worker/gpu_worker.py`、`vllm/v1/attention/backends/flash_attn.py`。
 
@@ -20,13 +20,14 @@ GPUModelRunner（vllm/v1/worker/gpu_model_runner.py）★本文重点
 ```
 
 - **Executor**：对上（EngineCore）提供 `execute_model` 接口，对下把任务分发给 Worker。单卡时就是薄薄一层转发；多卡（张量并行/流水线并行）时负责协调。
-- **GPUWorker**：一张卡的「化身」。负责初始化 CUDA、加载模型权重、显存 profiling（算能开多少 KV block，见 03）。
+- **GPUWorker**：一张卡的「化身」。负责初始化 CUDA、加载模型权重、显存 profiling（算能开多少 KV block，见 [03](03-PagedAttention与KVCache.md)）。
 - **GPUModelRunner**：**执行层的心脏**。把「一堆变长请求」变成「GPU 能吃的规整张量」，调用模型，再把输出变回「每个请求的 token」。
 
-回顾 01 的 `EngineCore.step()`：`self.model_executor.execute_model(scheduler_output)` 这一行，最终就落到 `GPUModelRunner.execute_model`。
+回顾 [01](01-请求的一生-主控制流.md) 的 `EngineCore.step()`：`self.model_executor.execute_model(scheduler_output)` 这一行，最终就落到 `GPUModelRunner.execute_model`。
 
 ---
 
+<a id="sec-1"></a>
 ## 1. 核心难题：变长请求怎么喂给 GPU
 
 GPU 擅长「大而规整」的张量运算。但一个 batch 里的请求千奇百怪：
@@ -45,7 +46,7 @@ cu_seqlens: [0,                    10,    11,   12]  ← 累积边界（谁从�
 
 这就是下面 `_prepare_inputs` 在做的事。
 
-> 本篇沿用 `00` 篇的统一示例（A/B 两请求，共享 40-token 的 system prompt）。
+> 本篇沿用 [`00` 篇](00-全局架构与数据流总览.md)的统一示例（A/B 两请求，共享 40-token 的 system prompt）。
 
 ### 1.1 `execute_model` 内部流程图 ★
 
@@ -86,10 +87,11 @@ execute_model(scheduler_output)
 └─────────────────────────────────────────────────┘
 ```
 
-四步对应下面 §2（①）、§4（②③）、§6（④），§3/§5 是①里 block_table/slot_mapping 的展开。
+四步对应下面 [§2](#sec-2)（①）、[§4](#sec-4)（②③）、[§6](#sec-6)（④），[§3](#sec-3)/[§5](#sec-5) 是①里 block_table/slot_mapping 的展开。
 
 ---
 
+<a id="sec-2"></a>
 ## 2. 打平请求：`_prepare_inputs`
 
 文件：`vllm/v1/worker/gpu_model_runner.py`（第 2001 行）
@@ -123,7 +125,7 @@ execute_model(scheduler_output)
         tokens.append(scheduler_output.num_scheduled_tokens[i])
     ```
   - 一行写完「遍历 + 取值 + 收集成列表」。读法：「对 req_ids 里每个 i，取出 num_scheduled_tokens[i]，组成列表」。
-  - 【逻辑】收集「本轮每个请求要算多少 token」（就是 02 调度器分配的额度）。
+  - 【逻辑】收集「本轮每个请求要算多少 token」（就是 [02](02-调度器-连续批处理.md) 调度器分配的额度）。
 - `num_scheduled_tokens = np.array(tokens, dtype=np.int32)`
   - 【PyTorch/NumPy】`np.array(...)` 把 Python 列表转成 NumPy 数组（高效数值计算）。`dtype=np.int32` 指定为 32 位整数。
 - `max_num_scheduled_tokens = max(tokens)` :本轮最长的请求要算多少 token（后面 kernel 要用）。
@@ -147,7 +149,7 @@ execute_model(scheduler_output)
   - 每个位置属于哪个请求。请求 0 占 2 格、请求 1 占 5 格、请求 2 占 3 格。
   - 【NumPy】`np.repeat(值, 次数)`：把每个值重复对应次数。`np.repeat([0,1,2], [2,5,3])` → 上面结果。
 - `cu_num_tokens = [2, 7, 10]`（累积和 cumsum）
-  - 每个请求的**结束边界**：请求 0 到第 2 个，请求 1 到第 7 个，请求 2 到第 10 个。这就是 §1 说的 `cu_seqlens`。
+  - 每个请求的**结束边界**：请求 0 到第 2 个，请求 1 到第 7 个，请求 2 到第 10 个。这就是 [§1](#sec-1) 说的 `cu_seqlens`。
 - `arange = [0,1, 0,1,2,3,4, 0,1,2]`
   - 每个 token 在它自己请求内部的**局部位置**（第几个）。
 
@@ -166,9 +168,10 @@ execute_model(scheduler_output)
 
 ---
 
+<a id="sec-3"></a>
 ## 3. 分页注意力的桥梁：slot_mapping 与 block_table
 
-打平 token 之后，最关键的是告诉 GPU：**每个 token 的 KV 该写到 / 读自哪个物理块**。这就是 03 的 block table 在执行层的落地，靠两个张量：
+打平 token 之后，最关键的是告诉 GPU：**每个 token 的 KV 该写到 / 读自哪个物理块**。这就是 [03](03-PagedAttention与KVCache.md) 的 block table 在执行层的落地，靠两个张量：
 
 - **`slot_mapping`（槽位映射）**：一维，长度 = 本轮 token 数。第 i 个元素 = 「第 i 个 token 的 KV 应该写进 KV Cache 的哪个物理槽位（= 块号 × 块大小 + 块内偏移）」。**写 KV 用它**。
 - **`block_table`（块表）**：二维 `[请求数, 每请求最大块数]`。记录每个请求用了哪些物理块。**读历史 KV 做 attention 用它**。
@@ -185,8 +188,8 @@ execute_model(scheduler_output)
 
 ### 3.1 统一示例：A/B 打平成张量的具体数值 ★
 
-把 02 篇产出的 step #1 `SchedulerOutput`（A 算 48 token、B 算 18 token，B 前缀命中）
-喂进 `_prepare_inputs`，看张量长什么样。沿用 03 篇分到的物理块：
+把 [02 篇](02-调度器-连续批处理.md)产出的 step #1 `SchedulerOutput`（A 算 48 token、B 算 18 token，B 前缀命中）
+喂进 `_prepare_inputs`，看张量长什么样。沿用 [03 篇](03-PagedAttention与KVCache.md)分到的物理块：
 A=`[10,11,12]`，B=`[10,11,13,14]`（前两块与 A 共享）。
 
 **① 变长打平（零 padding）**，A 的 48 个 + B 的 18 个新 token 首尾相接：
@@ -203,7 +206,7 @@ positions = [0,1,2,...,47,   32,33,...,49]
 ```
 注意 B 从 **32** 开始，不是 0——因为前 32 个位置的 KV 已经在共享块里算好了。
 
-**③ 打平索引（§2 的 np.repeat/cumsum 在本例的值）：**
+**③ 打平索引（[§2](#sec-2) 的 np.repeat/cumsum 在本例的值）：**
 ```python
 req_indices = [0]*48 + [1]*18            # 每个位置属于哪个请求
 cu_num_tokens = [48, 66]                 # 累积边界(cu_seqlens): A到48, B到66
@@ -246,6 +249,7 @@ SchedulerOutput{A:48, B:18}
 
 ---
 
+<a id="sec-4"></a>
 ## 4. 跑模型：`execute_model` → `_model_forward`
 
 文件：`gpu_model_runner.py`（`execute_model` 第 4259 行，`_model_forward` 第 3937 行）
@@ -279,7 +283,7 @@ SchedulerOutput{A:48, B:18}
 
 - `self.model(input_ids=..., ...)`
   - 【PyTorch】`self.model` 是一个 `nn.Module`（PyTorch 模型对象）。**直接「像调用函数一样」调用一个模型对象 `self.model(...)`，PyTorch 会自动触发它的 `forward` 方法**。这是 PyTorch 的核心约定：你几乎从不手写 `.forward()`，而是 `model(x)`。
-  - 【逻辑】这一行就是「模型前向计算」：input_ids（一维打平的 token）进去，经过 embedding → N 层 transformer（每层含 attention + FFN）→ 输出 `hidden_states`（每个 token 的高维表示）。attention 层内部会用到 §3 的 block_table/slot_mapping 读写 KV Cache。
+  - 【逻辑】这一行就是「模型前向计算」：input_ids（一维打平的 token）进去，经过 embedding → N 层 transformer（每层含 attention + FFN）→ 输出 `hidden_states`（每个 token 的高维表示）。attention 层内部会用到 [§3](#sec-3) 的 block_table/slot_mapping 读写 KV Cache。
 - `**model_kwargs`
   - 【Python 重点】`**` 是「字典解包」。如果 `model_kwargs = {"a": 1, "b": 2}`，那么 `f(**model_kwargs)` 等价于 `f(a=1, b=2)`。用于把一批可变的关键字参数灵活传下去。
   - （对应地，`*args` 是「列表解包」，把列表拆成位置参数。）
@@ -300,6 +304,7 @@ SchedulerOutput{A:48, B:18}
 
 ---
 
+<a id="sec-4-5"></a>
 ## 4.5 揭开黑盒：`self.model(...)` 一次前向的矩阵运算全过程 ★（可运行 demo）
 
 上面那行 `self.model(input_ids=...)` 是整篇最「黑盒」的一步——一行代码，里面却是 embedding → 多层 transformer → hidden_states 的全部矩阵运算。这一节用一个**缩微到能手算、能直接运行**的玩具模型，把这行黑盒彻底拆开，让你看清每一步张量的**形状**和**数值**怎么流动。
@@ -308,7 +313,7 @@ SchedulerOutput{A:48, B:18}
 
 ### 4.5.1 设定：一个 3 token 的迷你 prefill
 
-沿用统一示例的思路，假设有一个请求，prefill 3 个 token（对应 §3 里 `input_ids` 的一小段缩影）：
+沿用统一示例的思路，假设有一个请求，prefill 3 个 token（对应 [§3](#sec-3) 里 `input_ids` 的一小段缩影）：
 
 ```
 token 序列:   [7, 2, 5]      ← 3 个 token 的 id（真实里是分词结果）
@@ -317,8 +322,9 @@ d_model = 4                  ← 每个 token 用 4 维向量表示（真实是 
 1 层 transformer, 1 个 attention 头
 ```
 
-这正是 `_prepare_inputs`（§2）打平后交给模型的 `input_ids`（一维，长度 3）。下面走一遍 `self.model(...)` 内部。
+这正是 `_prepare_inputs`（[§2](#sec-2)）打平后交给模型的 `input_ids`（一维，长度 3）。下面走一遍 `self.model(...)` 内部。
 
+<a id="sec-4-5-2"></a>
 ### 4.5.2 完整可运行 demo（纯 NumPy，复制即跑）
 
 ```python
@@ -415,11 +421,11 @@ print("⑦ 采样出的 next_token id:", next_token)
 |---|---|---|---|
 | ① embedding | id → 向量 | `vllm/model_executor/models/llama.py:377`（`embed_tokens`） | `self.model(...)` 内部第一步（模型的 `embed_tokens`） |
 | ② Q/K/V 投影 | 线性变换 | `vllm/model_executor/models/llama.py:163`（`qkv_proj`） | 模型每层 attention 的 `qkv_proj` |
-| ③④ 注意力 | scores→softmax→加权 | `vllm/v1/attention/backends/flash_attn.py:1200`（`flash_attn_varlen_func`） | §5.2 的 `flash_attn_varlen_func`（GPU 上高度优化的同一套数学） |
+| ③④ 注意力 | scores→softmax→加权 | `vllm/v1/attention/backends/flash_attn.py:1200`（`flash_attn_varlen_func`） | [§5.2](#sec-5-2) 的 `flash_attn_varlen_func`（GPU 上高度优化的同一套数学） |
 | ⑤ FFN | 非线性变换 | `vllm/model_executor/models/llama.py:80`（`LlamaMLP`） | 模型每层的 MLP |
 | （重复 N 层） | 叠加表达能力 | `vllm/model_executor/models/llama.py:249,384`（`LlamaDecoderLayer` / `self.layers`） | Llama 的 32 层 `decoder_layers` |
-| ⑥ compute_logits | hidden→词表分数 | `vllm/model_executor/models/llama.py:529`（`compute_logits`） | §4 的 `self.model.compute_logits`（`lm_head`） |
-| ⑦ argmax | 挑 token | `vllm/v1/worker/gpu_model_runner.py:4638`（`sample_tokens`）→ `vllm/v1/sample/sampler.py` | §6 的 `sample_tokens`（这里是 temperature=0 贪心） |
+| ⑥ compute_logits | hidden→词表分数 | `vllm/model_executor/models/llama.py:529`（`compute_logits`） | [§4](#sec-4) 的 `self.model.compute_logits`（`lm_head`） |
+| ⑦ argmax | 挑 token | `vllm/v1/worker/gpu_model_runner.py:4638`（`sample_tokens`）→ `vllm/v1/sample/sampler.py` | [§6](#sec-6) 的 `sample_tokens`（这里是 temperature=0 贪心） |
 
 > 行号基于当前源码版本，随版本可能微调；按符号名（`embed_tokens`/`qkv_proj`/`LlamaMLP` 等）搜索更稳。
 
@@ -427,12 +433,13 @@ print("⑦ 采样出的 next_token id:", next_token)
 
 demo 把结构讲清了，但真实 vLLM 为了「快」和「省显存」，在三处做了工程化改造——这正是前面几篇的主题：
 
-1. **KV 不重算，而是缓存**（§3、§5.1）：demo 里每次都重新算全部 K/V。真实 decode 时，前面 token 的 K/V 已经算过并存在 KV Cache 里（`reshape_and_cache` 写入），当前步只算**新 token** 的 K/V，历史直接从物理块读——这就是 `slot_mapping`（写）+ `block_table`（读）的意义。
-2. **多请求打平，不是一个个跑**（§2）：demo 只有 1 个序列。真实一个 batch 里 A/B/C 多个请求首尾相接成一维长条，靠 `cu_seqlens` 区分边界，一次 kernel 算完所有请求（连续批处理，02 篇）。
-3. **kernel 融合 + CUDA Graph**（§5、§7.2）：demo 里 `②③④` 是分开的 numpy 运算。真实用 `flash_attn_varlen_func` 把它们**融合成一个 GPU 算子**（不落地中间的 `[3,3]` 分数矩阵，省显存也更快），decode 阶段还用 CUDA Graph 录制回放省启动开销。
+1. **KV 不重算，而是缓存**（[§3](#sec-3)、[§5.1](#sec-5-1)）：demo 里每次都重新算全部 K/V。真实 decode 时，前面 token 的 K/V 已经算过并存在 KV Cache 里（`reshape_and_cache` 写入），当前步只算**新 token** 的 K/V，历史直接从物理块读——这就是 `slot_mapping`（写）+ `block_table`（读）的意义。
+2. **多请求打平，不是一个个跑**（[§2](#sec-2)）：demo 只有 1 个序列。真实一个 batch 里 A/B/C 多个请求首尾相接成一维长条，靠 `cu_seqlens` 区分边界，一次 kernel 算完所有请求（连续批处理，[02 篇](02-调度器-连续批处理.md)）。
+3. **kernel 融合 + CUDA Graph**（[§5](#sec-5)、[§7.2](#sec-7-2)）：demo 里 `②③④` 是分开的 numpy 运算。真实用 `flash_attn_varlen_func` 把它们**融合成一个 GPU 算子**（不落地中间的 `[3,3]` 分数矩阵，省显存也更快），decode 阶段还用 CUDA Graph 录制回放省启动开销。
 
-> 一句话：**demo 展示的是「数学骨架」，vLLM 干的是「让这套骨架在 GPU 上又快又省地跑大 batch」**。你看懂了骨架，再回头看 §2~§7 的每个优化，就知道它们各自在优化骨架的哪一处。
+> 一句话：**demo 展示的是「数学骨架」，vLLM 干的是「让这套骨架在 GPU 上又快又省地跑大 batch」**。你看懂了骨架，再回头看 [§2](#sec-2)~[§7](#sec-7) 的每个优化，就知道它们各自在优化骨架的哪一处。
 
+<a id="sec-4-5-5"></a>
 ### 4.5.5 真实运行流程：同一套骨架的 vLLM 版核心代码
 
 前面 demo 用 numpy 讲清了「数学长什么样」。这一节把**同样的 7 步**换成 vLLM 真实源码（PyTorch + CUDA kernel）过一遍——**结构和 demo 一一对应，只是每一步都换成了工程化实现**。全部是 `llama.py` / `flash_attn.py` 里的真实核心逻辑（省略了初始化、并行、量化等旁支，只留主干）。
@@ -484,7 +491,7 @@ def forward(self, positions, hidden_states):
     return output
 ```
 
-关键差异全在这一行 `self.attn(q, k, v)`：demo 里 `③④` 是 `scores→mask→softmax→@V` 四步分开的 numpy；真实里它们被**融合进一个 CUDA kernel**（`flash_attn_varlen_func`，见 §5.2），既不落地中间的分数矩阵、又顺带读写分页 KV Cache（§5.1 的 `slot_mapping`/`block_table`）。QKV 也从 demo 的三个独立矩阵合并成一个 `qkv_proj`（少一次 kernel 启动）。
+关键差异全在这一行 `self.attn(q, k, v)`：demo 里 `③④` 是 `scores→mask→softmax→@V` 四步分开的 numpy；真实里它们被**融合进一个 CUDA kernel**（`flash_attn_varlen_func`，见 [§5.2](#sec-5-2)），既不落地中间的分数矩阵、又顺带读写分页 KV Cache（[§5.1](#sec-5-1) 的 `slot_mapping`/`block_table`）。QKV 也从 demo 的三个独立矩阵合并成一个 `qkv_proj`（少一次 kernel 启动）。
 
 #### FFN：`LlamaMLP.forward` —— 对应 demo ⑤
 
@@ -515,7 +522,7 @@ def compute_logits(self, hidden_states):
 
 #### 一句话总结这两节
 
-demo（§4.5.2）和真实代码（§4.5.5）**是同一套流程的两个视角**：
+demo（[§4.5.2](#sec-4-5-2)）和真实代码（[§4.5.5](#sec-4-5-5)）**是同一套流程的两个视角**：
 
 | | demo（讲原理） | 真实 vLLM（跑生产） |
 |---|---|---|
@@ -531,12 +538,14 @@ demo（§4.5.2）和真实代码（§4.5.5）**是同一套流程的两个视角
 
 ---
 
+<a id="sec-5"></a>
 ## 5. attention kernel 如何用 block_table —— 分页注意力落地
 
 文件：`vllm/v1/attention/backends/flash_attn.py`（`forward` 第 874 行）
 
-模型每一层的 attention，最终调到 backend 的 `forward`。这里能看到 03 讲的分页 KV 如何被真正读写。
+模型每一层的 attention，最终调到 backend 的 `forward`。这里能看到 [03](03-PagedAttention与KVCache.md) 讲的分页 KV 如何被真正读写。
 
+<a id="sec-5-1"></a>
 ### 5.1 写 KV Cache：用 slot_mapping
 
 ```python
@@ -552,8 +561,9 @@ demo（§4.5.2）和真实代码（§4.5.5）**是同一套流程的两个视角
         )
 ```
 
-【逻辑】当前这一步新算出来的 `key`/`value`，按 `slot_mapping` 指定的位置，**分散写入（scatter）** 到物理 KV Cache 里。第 i 个 token 写到 `slot_mapping[i]` 那个槽。写完，这些 KV 就缓存住了，后续步骤能复用（这正是 03 「KV Cache 复用」的物理实现）。
+【逻辑】当前这一步新算出来的 `key`/`value`，按 `slot_mapping` 指定的位置，**分散写入（scatter）** 到物理 KV Cache 里。第 i 个 token 写到 `slot_mapping[i]` 那个槽。写完，这些 KV 就缓存住了，后续步骤能复用（这正是 [03](03-PagedAttention与KVCache.md) 「KV Cache 复用」的物理实现）。
 
+<a id="sec-5-2"></a>
 ### 5.2 读 KV 做注意力：用 block_table
 
 ```python
@@ -583,11 +593,12 @@ demo（§4.5.2）和真实代码（§4.5.5）**是同一套流程的两个视角
 
 ---
 
+<a id="sec-6"></a>
 ## 6. 采样出 token：`sample_tokens`
 
 文件：`gpu_model_runner.py`（第 4638 行）
 
-有了 logits（词表分数），最后一步是「挑出下一个 token」。回顾 01：`EngineCore.step()` 里 `execute_model` 拿到结果后（或单独）调 `sample_tokens`。
+有了 logits（词表分数），最后一步是「挑出下一个 token」。回顾 [01](01-请求的一生-主控制流.md)：`EngineCore.step()` 里 `execute_model` 拿到结果后（或单独）调 `sample_tokens`。
 
 ```python
     def sample_tokens(self, grammar_output):
@@ -613,25 +624,27 @@ demo（§4.5.2）和真实代码（§4.5.5）**是同一套流程的两个视角
   - 贪心（temperature=0）：直接取分数最高的词。
   - 采样：按概率分布随机抽（温度调节随机性，top-p/top-k 限制候选范围）。
   - 采样逻辑在 `vllm/v1/sample/` 目录。
-- `sampler_output.sampled_token_ids`：**本轮每个请求新生成的那个 token**。它会被打包进 `ModelRunnerOutput` 返回，回到 02 的 `scheduler.update_from_output` 去「记账」——追加到请求输出、判断是否结束。
+- `sampler_output.sampled_token_ids`：**本轮每个请求新生成的那个 token**。它会被打包进 `ModelRunnerOutput` 返回，回到 [02](02-调度器-连续批处理.md) 的 `scheduler.update_from_output` 去「记账」——追加到请求输出、判断是否结束。
 
 至此，`EngineCore.step()` 的一整轮闭环完成，生成了一个 token。下一轮 step 再来一遍。
 
 ---
 
+<a id="sec-7"></a>
 ## 7. Worker 层的两个「幕后」职责（gpu_worker.py）
 
 `GPUWorker` 在正式推理前，还干了两件对理解 vLLM 很重要的事：
 
 ### 7.1 显存 profiling：`determine_available_memory`
 
-【逻辑】vLLM 启动时要决定「能开多少 KV Cache 块」（03 的物理块总数从哪来）。做法：
+【逻辑】vLLM 启动时要决定「能开多少 KV Cache 块」（[03](03-PagedAttention与KVCache.md) 的物理块总数从哪来）。做法：
 1. 加载模型权重后，先跑一次「假的」最大负载前向（`_dummy_run`），看峰值占了多少显存。
 2. `可用于 KV 的显存 = 总显存 × gpu_memory_utilization - 权重 - 激活峰值`。
 3. 除以「每块的大小」= 能开的块数。
 
 这就是配置参数 `gpu_memory_utilization`（默认 0.92，即用 92% 显存）的作用点。理解了这里，就明白「为什么调大它能容纳更多并发请求，但调太大会 OOM」。
 
+<a id="sec-7-2"></a>
 ### 7.2 CUDA Graph 捕获：`compile_or_warm_up_model`
 
 【逻辑】decode 阶段每步计算量小但调用极频繁，Python 逐次启动 GPU kernel 的开销（launch overhead）占比很高。vLLM 用 **CUDA Graph** 把「一次 decode 的整套 GPU 操作」录制成一张图，之后每步直接「回放」这张图，省掉重复的启动开销，显著加速。这在启动时预先「捕获」好（针对若干常见 batch size）。
@@ -696,15 +709,15 @@ demo（§4.5.2）和真实代码（§4.5.5）**是同一套流程的两个视角
 
 到这里，你已经贯通了 vLLM 的核心主干：
 
-- **01** 请求的一生（控制流骨架，step 心跳）
-- **02** 调度器（连续批处理、抢占）
-- **03** PagedAttention（分页 KV、前缀缓存、LRU）
+- **[01](01-请求的一生-主控制流.md)** 请求的一生（控制流骨架，step 心跳）
+- **[02](02-调度器-连续批处理.md)** 调度器（连续批处理、抢占）
+- **[03](03-PagedAttention与KVCache.md)** PagedAttention（分页 KV、前缀缓存、LRU）
 - **04** 执行层（变长打平、分页 attention kernel、采样）
 
 **建议动手**：用一个最小脚本 `LLM(model=...).generate(["Hello"], SamplingParams(max_tokens=5))`，在这几个函数打断点单步跟一遍，把四篇文档串起来看，理解会立刻立体化：
-- `EngineCore.step`（01）
-- `Scheduler.schedule` / `_preempt_request`（02）
-- `KVCacheManager.allocate_slots`（03）
+- `EngineCore.step`（[01](01-请求的一生-主控制流.md)）
+- `Scheduler.schedule` / `_preempt_request`（[02](02-调度器-连续批处理.md)）
+- `KVCacheManager.allocate_slots`（[03](03-PagedAttention与KVCache.md)）
 - `GPUModelRunner._prepare_inputs` / `sample_tokens`（04）
 
 **进阶方向**（掌握主干后按需）：投机解码 `v1/spec_decode/`、分布式并行 `distributed/`、具体模型实现 `model_executor/models/`（先读 `llama.py`）、在线服务 `entrypoints/serve/`。
