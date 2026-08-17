@@ -545,6 +545,7 @@ func applyFeatureGates(config *v1.Plugins) {
 | [04](04-面向大模型场景的能力与局限.md) | 大模型场景 | 默认调度器能做什么、做不到什么、DRA、怎么和 Volcano/Kueue 配合 |
 | [05](05-实战Demo.md) | 实战 Demo | 改配置、装箱策略、拓扑打散、抢占、开 gang gate 实测、排障 |
 | [06](06-扩展实战-自定义调度插件开发.md) | 扩展实战 | **每个扩展点一个可编译 demo**：out-of-tree 注册、CycleState、QueueingHint、Permit-gang、部署与验证 |
+| [07](07-免编译扩展-Extender与外部扩展点.md) | 免编译扩展 | **不改二进制**的六种方式：Extender(HTTP)、配置层、SchedulingGates、Webhook、DRA、Descheduler，各含部署 Demo |
 
 ---
 

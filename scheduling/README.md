@@ -83,6 +83,7 @@ flowchart LR
 | [04](kube-scheduler/04-面向大模型场景的能力与局限.md) | 大模型场景 | 能做好什么（装箱/DRA/打散）、做不到什么、三种落地形态 |
 | [05](kube-scheduler/05-实战Demo.md) | 实战 Demo | kind 集群 + 假 GPU：装箱、多 profile、抢占、拓扑打散、**开 gang gate 实测** |
 | [06](kube-scheduler/06-扩展实战-自定义调度插件开发.md) | 扩展实战 | **每个扩展点一个可编译 demo**：out-of-tree 注册、CycleState、QueueingHint、Permit-gang、参数解析、部署与验证 |
+| [07](kube-scheduler/07-免编译扩展-Extender与外部扩展点.md) | 免编译扩展 | **用官方镜像零编译**：Extender(HTTP 四动作)、配置层多 profile、SchedulingGates 配额控制器、Mutating Webhook、DRA Driver、Descheduler，各含部署 Demo 与排障 |
 
 ## Volcano 学习路线
 
