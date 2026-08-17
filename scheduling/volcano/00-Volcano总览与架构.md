@@ -41,6 +41,8 @@
 | 问题 | 默认调度器行为 | 后果（放到示例上） |
 |------|--------------|------------------|
 | **无 Gang（成组）语义** | 逐个 Pod 调度，能起几个起几个 | 作业 T 起了 5 个 Pod，剩 3 个没资源，5 个 Pod 占着 40 卡空转等同伴 → 资源死锁 |
+
+> 关于第一条需要补充一个时效说明：**Kubernetes v1.36 已在主干引入原生 gang 调度**（`GangScheduling` feature gate + `PodGroup` API `scheduling.k8s.io/v1alpha2`），但目前是 **Alpha 默认关闭**，且实现上是「Permit 挂起型」—— 等待期间 Pod 已 assume、占着资源，靠 5 分钟硬编码超时兜底；而 Volcano 是「事务型」，`Discard` 会立即释放。详见 [kube-scheduler 系列 00 篇 §6](../kube-scheduler/00-kube-scheduler总览与架构.md) 与 [04 篇 §4.3](../kube-scheduler/04-面向大模型场景的能力与局限.md)。表格其余各项在 v1.36 仍然成立。
 | **无队列/配额** | 只有 namespace ResourceQuota（硬上限，不可借用） | `serve` 空闲时 `train` 借不到卡；`train` 撑满时 `serve` 上线要不到卡 |
 | **无作业级公平** | Pod 级优先级，先到先得 | 一个 1000 Pod 的大作业把队列灌满，小作业永远排在后面 |
 | **无拓扑感知** | 不理解 NVLink / 交换机层级 | 作业 S 的 4 个 TP rank 被打散到 4 台机器，跨机 PCIe/TCP 通信，吞吐掉几倍 |

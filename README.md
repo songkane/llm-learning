@@ -9,7 +9,7 @@
 | 分类 | 目录 | 内容 |
 |------|------|------|
 | 推理引擎 | [`inference-engine/`](inference-engine/) | 大模型推理引擎的架构与源码剖析（vLLM、SGLang） |
-| 调度与编排 | [`scheduling/`](scheduling/) | 训练/推理作业的资源调度与编排（Volcano、Kueue） |
+| 调度与编排 | [`scheduling/`](scheduling/) | 训练/推理作业的资源调度与编排（kube-scheduler、Volcano、Kueue） |
 
 > 更多分类（训练、MaaS 平台、Agent、RAG 等）将持续补充。
 
@@ -29,11 +29,13 @@
 
 聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」。
 
+- [**kube-scheduler 源码学习**](scheduling/kube-scheduler/) —— K8s 原生调度器，一切的地基：调度框架 15 个扩展点、三队列与 QueueingHint、增量快照与 assume、过滤采样与打分归一化、抢占六轮打分、DRA，以及 **v1.36 新引入的原生 gang 调度与拓扑感知 Placement**（Alpha）。
+
 - [**Volcano 源码学习**](scheduling/volcano/) —— Pod 级批调度器：Session/Action/Plugin 框架、Gang 调度事务机制、队列配额、拓扑感知、GPU 共享。
 
 - [**Kueue 源码学习**](scheduling/kueue/) —— 作业级准入控制器：ClusterQueue/Cohort 配额借用、ResourceFlavor 异构机型、TAS 拓扑感知、MultiKueue 多集群。
 
-> 一句话区分：**Kueue 决定「作业什么时候可以开始」，Volcano 决定「Pod 落到哪个节点」**，两者互补可叠加。详见 [scheduling/README](scheduling/README.md)。
+> 一句话区分：**Kueue 决定「作业什么时候可以开始」，kube-scheduler 与 Volcano 决定「Pod 落到哪个节点」**（后两者按 `schedulerName` 分流、互斥）。建议先读 kube-scheduler 的 00~01 建立地基，再看另两个补了什么缺口。详见 [scheduling/README](scheduling/README.md)。
 
 ## 使用建议
 
@@ -45,4 +47,4 @@
 - **真实源码 + 逐行注释**：摘录真实代码，注释分 `【逻辑】`（系统在做什么、为什么）和 `【Python】`/`【Go】`（语法讲解）两类。
 - **图示优先**：架构图、进程模型图、时序图、状态机图，帮助建立空间直觉。
 - **每篇附速查表**：语法速查 + 必记要点。
-- **刻意横向对照**：同类项目（vLLM ↔ SGLang、Volcano ↔ Kueue）使用一致的示例与结构，便于比较设计取舍。
+- **刻意横向对照**：同类项目（vLLM ↔ SGLang、kube-scheduler ↔ Volcano ↔ Kueue）使用一致的示例与结构，便于比较设计取舍。
