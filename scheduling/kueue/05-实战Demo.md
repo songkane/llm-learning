@@ -2,7 +2,7 @@
 
 > 从零跑通：安装 → 配额体系 → 批作业 → 分布式训练（JobSet + TAS）→ 推理服务（LWS）→ 跨队列借用与回收 → 部分准入 → 排障。
 >
-> 所有 YAML 使用 `kueue.x-k8s.io/v1beta2`。GPU 部分需要集群已装 NVIDIA device plugin；没有 GPU 时把 `nvidia.com/gpu` 换成 `cpu` 也能完整验证配额逻辑。
+> 所有 YAML 使用 `kueue.x-k8s.io/v1beta2`，**版本基线 v0.19.1**。GPU 部分需要集群已装 NVIDIA device plugin；没有 GPU 时把 `nvidia.com/gpu` 换成 `cpu` 也能完整验证配额逻辑。
 
 ---
 

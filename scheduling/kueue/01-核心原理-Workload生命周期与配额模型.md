@@ -3,6 +3,8 @@
 > 本篇讲 Kueue 的两条主线：**一个 Workload 的状态机怎么流转**，以及 **配额（借用 / 借出 / 抢占 / 公平共享）到底怎么算**。这两件事想清楚了，Kueue 的行为就没有意外了。
 >
 > 涉及源码：`pkg/cache/scheduler/{resource_node,clusterqueue,cohort,fair_sharing}.go`、`pkg/cache/queue/cluster_queue.go`、`pkg/scheduler/flavorassigner/`、`pkg/scheduler/preemption/`
+>
+> 源码基线：**v0.19.1**
 
 ---
 

@@ -3,6 +3,8 @@
 > 本篇回答：**vc-scheduler 每一秒到底做了什么**。这是 Volcano 全部能力的骨架，后面所有插件与特性都挂在这个骨架上。
 >
 > 涉及源码：`pkg/scheduler/scheduler.go`、`pkg/scheduler/framework/{framework,session,session_plugins,statement,interface}.go`、`pkg/scheduler/util.go`、`pkg/scheduler/conf/scheduler_conf.go`
+>
+> 源码基线：**v1.15.1**
 
 ---
 
@@ -270,7 +272,7 @@ framework.RegisterPluginBuilder(networktopologyaware.PluginName, networktopology
 // ... 共 20+ 个内置插件
 ```
 
-内置插件全景（截至 master）：
+内置插件全景（v1.15.1）：
 
 | 类别 | 插件 |
 |------|------|

@@ -4,10 +4,12 @@
 
 ## 目录
 
-| 项目 | 目录 | 定位 | 说明 |
-|------|------|------|------|
-| Volcano | [`volcano/`](volcano/) | **Pod 级批调度器** | CNCF 批量计算调度系统：Gang 调度、队列配额、拓扑感知、GPU 共享 |
-| Kueue | [`kueue/`](kueue/) | **作业级准入控制器** | Kubernetes SIG 项目：ClusterQueue/Cohort 配额借用、ResourceFlavor、TAS 拓扑感知、MultiKueue 多集群 |
+| 项目 | 目录 | 源码基线 | 定位 | 说明 |
+|------|------|---------|------|------|
+| Volcano | [`volcano/`](volcano/) | `v1.15.1` | **Pod 级批调度器** | CNCF 批量计算调度系统：Gang 调度、队列配额、拓扑感知、GPU 共享 |
+| Kueue | [`kueue/`](kueue/) | `v0.19.1` | **作业级准入控制器** | Kubernetes SIG 项目：ClusterQueue/Cohort 配额借用、ResourceFlavor、TAS 拓扑感知、MultiKueue 多集群 |
+
+> 两套文档都**钉在具体 release tag** 而非 master，所有函数名、字段名、代码片段都能在对应 tag 上逐字找到。`git checkout <tag>` 后即可边读边对照。版本差异与升级复查方法见各系列 00 篇的「附录：版本说明」。
 
 ## 先搞清楚两者的分工
 

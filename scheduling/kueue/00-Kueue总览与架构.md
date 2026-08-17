@@ -2,7 +2,14 @@
 
 > 本篇回答三个问题：**Kueue 解决什么问题**、**它和 kube-scheduler / Volcano 的边界在哪**、**一个作业从提交到 Pod 跑起来经过了什么**。
 >
-> 源码基线：`sigs.k8s.io/kueue` master（API 存储版本已升到 `v1beta2`，含 TAS 多层切片、MultiKueue、ConcurrentAdmission、Elastic Jobs 等较新特性）。
+> **源码基线：`sigs.k8s.io/kueue` v0.19.1**（最新稳定 release，API 存储版本 `v1beta2`，含 TAS 多层切片、MultiKueue、Elastic Jobs 等特性）。
+>
+> ```bash
+> git clone https://github.com/kubernetes-sigs/kueue.git && cd kueue
+> git checkout v0.19.1
+> ```
+>
+> 与 Volcano 系列一样钉住 tag 而不用 master，保证文档里的函数名、字段名与你 checkout 出来的代码逐字一致。版本差异见 [附录：版本说明](#附录版本说明)。
 
 ---
 
@@ -455,3 +462,61 @@ metadata:
 | [03](03-核心代码分析-缓存快照与控制器.md) | 缓存/快照与控制器 | 资源账本树、等待队列、jobframework、TAS/MultiKueue |
 | [04](04-面向大模型训练与推理的能力地图.md) | 大模型能力地图 | 训练要什么、推理要什么、坑与取舍 |
 | [05](05-实战Demo.md) | 实战 Demo | 安装 → 配额 → 训练 → 推理 → 借用抢占 → TAS → 排障 |
+
+---
+
+## 附录：版本说明
+
+### A.1 为什么钉 v0.19.1
+
+本系列所有源码引用均以 **`v0.19.1`** 为准（编写时最新稳定 release；`v0.20.0-devel` 是开发分支标记，不是发布版）。
+
+```bash
+git clone https://github.com/kubernetes-sigs/kueue.git && cd kueue
+git checkout v0.19.1
+git describe --tags        # v0.19.1
+```
+
+Kueue 迭代很快（约 6~8 周一个 minor），API 从 `v1beta1` 到 `v1beta2`、缓存包从 `pkg/{cache,queue}` 重构到 `pkg/cache/{scheduler,queue}` 都发生在最近几个版本。**读 Kueue 资料时第一件事就是确认版本**，否则路径和字段名都对不上。
+
+### A.2 v0.19.1 已包含的关键特性
+
+| 特性 | 位置 / 标识 |
+|------|-----------|
+| `v1beta2` 作为存储版本 | `apis/kueue/v1beta2/`（`v1beta1` / `v1alpha1` 仍在，仅作转换） |
+| 缓存分包 | `pkg/cache/scheduler`（配额账本）、`pkg/cache/queue`（等待队列）、`pkg/cache/hierarchy` |
+| `DeferredFit` 模式 | `pkg/scheduler/flavorassigner/` |
+| 抢占目标重叠重算 | `RecomputeAssignmentUponPreemptionTargetsOverlap` |
+| sticky workload / 按 hash 批量下沉 | `pkg/cache/queue/cluster_queue.go` |
+| Elastic Jobs（workload slice） | `pkg/workloadslicing/` |
+| TAS 快照与 what-if 推演 | `SimulateWorkloadRemoval` / `tas_flavor_snapshot.go` |
+| `kueue_admission_cycle_preemption_skips` 指标 | `pkg/metrics/` |
+
+验证方式：
+
+```bash
+git ls-tree --name-only v0.19.1 apis/kueue/ pkg/cache/
+git grep -l "DeferredFit" v0.19.1 -- 'pkg/**/*.go'
+```
+
+### A.3 与 master / v0.20 的已知差异
+
+| 位置 | v0.19.1（文档基线） | master / v0.20+ |
+|------|-------------------|-----------------|
+| `preemptionCtx.workloadUsage`（02 篇 §6.1） | `Quota: assignment.TotalRequestsFor(log, &wl)` | `Quota` 拆出子字段：`Quota.Assigned` |
+| 抢占重算指标（03 篇 §9） | 只有 `kueue_admission_cycle_preemption_skips` | 新增 `kueue_preemption_target_recomputations_total{result}`（DeferredFit / NewTargets / Skipped） |
+| AFS 用量账本 | `WithAfsEntryPenalties` + `WithAfsConsumedResources` | 合并为 `WithAfsUsageLedger`（`pkg/cache/queue/afs`） |
+| Fair Sharing 抢占日志 | 无 | 新增 `pkg/scheduler/preemption/fair_sharing_log.go` |
+
+这些都是增量演进，不改变本系列描述的准入流程与配额语义。
+
+### A.4 升级时怎么复查
+
+```bash
+cd /path/to/kueue
+git diff --stat v0.19.1..<新tag> -- \
+  apis/kueue/v1beta2/ pkg/scheduler/ pkg/cache/ \
+  pkg/controller/jobframework/ pkg/features/ pkg/metrics/ pkg/workloadslicing/
+```
+
+另外每次升级务必对一遍 feature gate 默认值（04 篇 §5）—— Kueue 的 gate 毕业节奏很快，`TopologyAwareScheduling`、`MultiKueue`、`ElasticJobsViaWorkloadSlices` 都是近几个版本才转 Beta 默认开启的。

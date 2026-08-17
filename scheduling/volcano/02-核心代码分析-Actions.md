@@ -3,6 +3,8 @@
 > 本篇逐个拆解 Volcano 的 8 个内置 Action。Action 是调度**流程**，看懂它们，就知道「一轮调度里资源是怎么被分出去、又怎么被抢回来的」。
 >
 > 源码目录：`pkg/scheduler/actions/`
+>
+> 源码基线：**v1.15.1**
 
 ```go
 // pkg/scheduler/actions/factory.go
@@ -324,13 +326,16 @@ for _, node := range selectedNodes {
 外层的提交条件是 **`JobPipelined`** 而不是 `JobReady`：
 
 ```go
+// Commit changes only if job is pipelined, otherwise try next job.
 if ssn.JobPipelined(preemptorJob) {
-    hasEvictions := stmt.HasEvictions()
-    stmt.Commit()                          // 真正下发 Evict + 记录 Pipelined
-    if hasEvictions { metrics.RegisterEvictionTransaction(pmpt.Name()) }
+    stmt.Commit()                           // 真正下发 Evict + 记录 Pipelined
 } else {
     stmt.Discard()                          // 抢了也凑不齐 gang → 白抢，回滚（不杀任何 Pod）
     continue
+}
+
+if assigned {
+    preemptors.Push(preemptorJob)           // 还能继续抢，放回队列下轮再来
 }
 ```
 

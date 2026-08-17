@@ -2,7 +2,16 @@
 
 > 本篇是 Volcano 系列的入口。目标是回答三个问题：**为什么大模型训练/推理需要 Volcano**、**Volcano 由哪些组件构成**、**一个任务从提交到 Pod 落到 GPU 上，中间经过了什么**。
 >
-> 源码基线：`volcano.sh/volcano` master（含 SubJob / HyperNode / 网络拓扑感知调度等较新特性）。
+> **源码基线：`volcano.sh/volcano` v1.15.1**（最新稳定 release，含 SubJob / HyperNode / 网络拓扑感知调度 / gangpreempt 等特性）。
+>
+> 全系列所有代码引用均以该 tag 为准，可直接对照：
+>
+> ```bash
+> git clone https://github.com/volcano-sh/volcano.git && cd volcano
+> git checkout v1.15.1
+> ```
+>
+> 为什么钉版本而不用 master：master 在持续变动（例如 `preempt` 的驱逐指标、调度器配置日志格式在 v1.15.1 之后才引入），钉住 tag 才能保证文档里的函数名、行为与你 checkout 出来的代码逐字一致。版本差异见 [附录：版本说明](#附录版本说明)。
 
 ---
 
@@ -361,3 +370,67 @@ sequenceDiagram
 | [03](03-核心代码分析-关键插件.md) | 关键插件源码分析 | gang / capacity / proportion / deviceshare / 拓扑感知 |
 | [04](04-面向大模型训练与推理的能力地图.md) | 大模型能力地图 | 训练要哪些特性、推理要哪些特性、怎么配 |
 | [05](05-实战Demo.md) | 实战 Demo | 从装 Volcano 到跑通训练 + 推理 + GPU 共享 |
+
+---
+
+## 附录：版本说明
+
+### A.1 为什么钉 v1.15.1
+
+本系列所有源码引用（函数名、字段名、代码片段、行为描述）均以 **`v1.15.1`** 为准 —— 这是编写时的最新**稳定** release（`v1.16.0-alpha.x` 属于预发布）。
+
+```bash
+git clone https://github.com/volcano-sh/volcano.git && cd volcano
+git checkout v1.15.1
+git describe --tags        # v1.15.1
+```
+
+用 tag 而不是 master 的原因很实际：master 每天都在动，文档里贴的代码片段过几周就对不上，读者照着 grep 找不到就会怀疑文档写错了。钉住 tag，**文档里的每一段代码都能在你 checkout 出来的仓库里逐字找到**。
+
+### A.2 v1.15.1 已包含的关键特性
+
+写这套文档时特意确认过，以下较新能力在 v1.15.1 中**都已存在**，不需要用 master：
+
+| 特性 | 位置 |
+|------|------|
+| `gangpreempt` / `gangreclaim` 成组抢占 | `pkg/scheduler/actions/gangpreempt/`、`gangreclaim/` |
+| SubJob / `subGroupPolicy`（子组级 gang 与拓扑） | `api.SubJobInfo`、`allocateForSubJob` |
+| HyperNode 网络拓扑感知 + 梯度搜索 | `ClusterTopHyperNode`、`HyperNodeGradientForJobFn` |
+| 统一驱逐扩展点 | `ssn.AddUnifiedEvictableFn` |
+| 37 个 Session 扩展点 | `pkg/scheduler/framework/session_plugins.go` |
+| capacity 的层级队列 + DRA 配额 | `pkg/scheduler/plugins/capacity/` |
+| deviceshare vGPU / 昇腾 vNPU | `pkg/scheduler/plugins/deviceshare/` |
+
+验证方式：
+
+```bash
+git ls-tree --name-only v1.15.1 pkg/scheduler/actions/
+git grep -l "ClusterTopHyperNode" v1.15.1 -- 'pkg/scheduler/**/*.go'
+git show v1.15.1:pkg/scheduler/framework/session_plugins.go | grep -cE '^func \(ssn \*Session\) Add\w+'   # 37
+```
+
+### A.3 与 master / v1.16 的已知差异
+
+如果你 checkout 的是 master 或 v1.16+，文档里有两处细节会不一样（不影响原理理解）：
+
+| 位置 | v1.15.1（文档基线） | master / v1.16+ |
+|------|-------------------|-----------------|
+| 调度器配置加载日志（05 篇 §0.2） | `loadSchedulerConf` 的 defer 打印 `Finished loading scheduler config. Final state: actions=... plugins=...` | 抽成 `logLoadedSchedulerConf`，打印 `Successfully loaded Scheduler conf as follows:` 并逐行输出完整 YAML |
+| `preempt` 提交段（02 篇 §3.3） | `JobPipelined` → `stmt.Commit()`；随后 `if assigned { preemptors.Push(...) }` | 新增 `stmt.HasEvictions()` 判断与 `metrics.RegisterEvictionTransaction(...)` 驱逐事务指标 |
+
+其余新增内容（`usage` 插件的负载预估重写、`gang` 的 `shouldSkipUnschedulableForReleasing`、`capacity`/`proportion` 的 `AddJobEnqueuedFn` inqueue 指标、`killJob` 对 `RestartPodAction` 保留 PodGroup 等）都是**增量特性**，不改变本系列描述的核心机制。
+
+### A.4 升级时怎么复查
+
+换版本后想快速确认文档还适用，跑一遍：
+
+```bash
+cd /path/to/volcano
+git diff --stat v1.15.1..<新tag> -- \
+  pkg/scheduler/scheduler.go pkg/scheduler/util.go \
+  pkg/scheduler/framework/ pkg/scheduler/actions/ \
+  pkg/scheduler/plugins/{gang,capacity,proportion,deviceshare,network-topology-aware}/ \
+  pkg/scheduler/api/job_info.go pkg/controllers/job/ pkg/controllers/podgroup/
+```
+
+这几条路径覆盖了本系列引用的全部代码，diff 干净就说明文档可以直接用。

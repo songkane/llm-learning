@@ -2,7 +2,7 @@
 
 > 从零跑通：安装 → 建队列 → 分布式训练（PyTorch）→ 推理服务（vLLM）→ GPU 共享 → 抢占与回收 → 排障。
 >
-> 所有 YAML 可直接使用，GPU 相关部分需要集群已装 NVIDIA device plugin。
+> **源码 / 版本基线：v1.15.1**。所有 YAML 可直接使用，GPU 相关部分需要集群已装 NVIDIA device plugin。
 
 ---
 
@@ -14,10 +14,11 @@
 # 方式一：Helm（推荐，可开 feature gate）
 helm repo add volcano-sh https://volcano-sh.github.io/helm-charts
 helm repo update
-helm install volcano volcano-sh/volcano -n volcano-system --create-namespace
+helm install volcano volcano-sh/volcano -n volcano-system --create-namespace \
+  --version 1.15.1
 
-# 方式二：一键 YAML（源码仓库自带）
-kubectl apply -f https://raw.githubusercontent.com/volcano-sh/volcano/master/installer/volcano-development.yaml
+# 方式二：一键 YAML（★ 用 tag 而不是 master，保证与文档一致）
+kubectl apply -f https://raw.githubusercontent.com/volcano-sh/volcano/v1.15.1/installer/volcano-development.yaml
 ```
 
 验证：
@@ -75,10 +76,14 @@ data:
 确认是否生效：
 
 ```bash
-kubectl -n volcano-system logs deploy/volcano-scheduler | grep -A20 "Successfully loaded Scheduler conf"
+kubectl -n volcano-system logs deploy/volcano-scheduler | grep "Finished loading scheduler config"
+# Finished loading scheduler config. Final state: actions=[enqueue allocate preempt reclaim backfill],
+#   plugins=[priority gang conformance cdp overcommit predicates capacity nodeorder binpack network-topology-aware]
 ```
 
-（`logLoadedSchedulerConf` 会把实际生效的配置逐行打印出来，这是确认「我改的配置到底有没有被读到」最可靠的方法。）
+这行日志（`loadSchedulerConf` 的 defer，需 `--v=2`）会打印**实际生效**的 action 与 plugin 列表，是确认「我改的配置到底有没有被读到」最可靠的方法。
+
+> 版本差异：v1.16 起改为 `logLoadedSchedulerConf`，日志变成 `Successfully loaded Scheduler conf as follows:` 并逐行打印完整 YAML。若你用的是更高版本，grep 关键字换成 `Successfully loaded Scheduler conf`。
 
 ---
 
@@ -631,7 +636,7 @@ ALLOC:.status.allocated,PENDING:.status.pending,INQUEUE:.status.inqueue
 
 # 调度器
 kubectl -n volcano-system logs deploy/volcano-scheduler --tail=200
-kubectl -n volcano-system logs deploy/volcano-scheduler | grep "Successfully loaded Scheduler conf" -A30
+kubectl -n volcano-system logs deploy/volcano-scheduler | grep "Finished loading scheduler config"
 
 # 提升日志级别定位单个 Pod（v=5 会打印每个节点的过滤/打分细节）
 kubectl -n volcano-system set env deploy/volcano-scheduler -c volcano-scheduler --list
