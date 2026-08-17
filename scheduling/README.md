@@ -77,11 +77,12 @@ flowchart LR
 | 篇 | 主题 | 核心问题 |
 |----|------|---------|
 | [00](kube-scheduler/00-kube-scheduler总览与架构.md) | 总览与架构 | 定位、三方对比、组件、Pod 的一生、**v1.36 原生 gang / 拓扑感知** |
-| [01](kube-scheduler/01-核心原理-调度周期与扩展点.md) | 调度周期与扩展点 | 15 个扩展点何时跑、七种 Status 语义、CycleState、MultiPoint |
+| [01](kube-scheduler/01-核心原理-调度周期与扩展点.md) | 调度周期与扩展点 | 15 个扩展点何时跑、七种 Status 语义、CycleState、MultiPoint，**完整 trace 一个 vLLM Pod（含逐项分数计算）** |
 | [02](kube-scheduler/02-核心代码分析-调度队列与缓存.md) | 调度队列与缓存 | 三队列流转、QueueingHint（GA）、增量快照、assume/forget/expire |
 | [03](kube-scheduler/03-核心代码分析-过滤打分与抢占.md) | 过滤打分与抢占 | 节点采样公式、打分归一化、抢占五步与六轮打分 |
 | [04](kube-scheduler/04-面向大模型场景的能力与局限.md) | 大模型场景 | 能做好什么（装箱/DRA/打散）、做不到什么、三种落地形态 |
 | [05](kube-scheduler/05-实战Demo.md) | 实战 Demo | kind 集群 + 假 GPU：装箱、多 profile、抢占、拓扑打散、**开 gang gate 实测** |
+| [06](kube-scheduler/06-扩展实战-自定义调度插件开发.md) | 扩展实战 | **每个扩展点一个可编译 demo**：out-of-tree 注册、CycleState、QueueingHint、Permit-gang、参数解析、部署与验证 |
 
 ## Volcano 学习路线
 

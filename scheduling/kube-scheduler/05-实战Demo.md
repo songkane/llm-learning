@@ -785,5 +785,5 @@ curl -sk https://localhost:10259/metrics | grep scheduler_pending_pods
 
 ---
 
-回到 [00 总览](00-kube-scheduler总览与架构.md) ｜ 上一篇 [04 能力与局限](04-面向大模型场景的能力与局限.md)
+回到 [00 总览](00-kube-scheduler总览与架构.md) ｜ 上一篇 [04 能力与局限](04-面向大模型场景的能力与局限.md) ｜ 下一篇 [06 自定义调度插件开发](06-扩展实战-自定义调度插件开发.md)
 ｜ 对比阅读 [Volcano 系列](../volcano/00-Volcano总览与架构.md) · [Kueue 系列](../kueue/00-Kueue总览与架构.md)

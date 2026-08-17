@@ -29,7 +29,7 @@
 
 聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」。
 
-- [**kube-scheduler 源码学习**](scheduling/kube-scheduler/) —— K8s 原生调度器，一切的地基：调度框架 15 个扩展点、三队列与 QueueingHint、增量快照与 assume、过滤采样与打分归一化、抢占六轮打分、DRA，以及 **v1.36 新引入的原生 gang 调度与拓扑感知 Placement**（Alpha）。
+- [**kube-scheduler 源码学习**](scheduling/kube-scheduler/) —— K8s 原生调度器，一切的地基：调度框架 15 个扩展点、三队列与 QueueingHint、增量快照与 assume、过滤采样与打分归一化、抢占六轮打分、DRA，以及 **v1.36 新引入的原生 gang 调度与拓扑感知 Placement**（Alpha）。附一篇**自定义插件开发实战**（每个扩展点一个可编译 demo）。
 
 - [**Volcano 源码学习**](scheduling/volcano/) —— Pod 级批调度器：Session/Action/Plugin 框架、Gang 调度事务机制、队列配额、拓扑感知、GPU 共享。
 
