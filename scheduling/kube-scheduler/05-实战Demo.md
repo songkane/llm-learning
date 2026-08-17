@@ -231,6 +231,8 @@ profiles:
       - name: NodeResourcesBalancedAllocation
 ```
 
+> 这里**故意只列 `nvidia.com/gpu`**：`resources` 是整体替换默认值（`{cpu:1, memory:1}`）而非追加，所以这个 profile 的打分完全由 GPU 主导，CPU / 内存不参与。GPU 专用池通常正是想要这个效果 —— 但如果这批节点还要混跑 CPU 负载，就要把 cpu / memory 一并列出来。
+
 使用：
 
 ```yaml
