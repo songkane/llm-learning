@@ -8,22 +8,41 @@
 
 | 分类 | 目录 | 内容 |
 |------|------|------|
-| 推理引擎 | [`inference-engine/`](inference-engine/) | 大模型推理引擎的架构与源码剖析（vLLM 等） |
-| 调度与编排 | [`scheduling/`](scheduling/) | 大模型训练/推理的资源调度与作业编排（Volcano、Kueue 等） |
+| 推理引擎 | [`inference-engine/`](inference-engine/) | 大模型推理引擎的架构与源码剖析（vLLM、SGLang） |
+| 调度与编排 | [`scheduling/`](scheduling/) | 训练/推理作业的资源调度与编排（Volcano、Kueue） |
 
-> 更多分类（训练框架、MaaS 平台、Agent、RAG 等）将持续补充。
+> 更多分类（训练、MaaS 平台、Agent、RAG 等）将持续补充。
 
 ## 已有内容
 
 ### 推理引擎
 
-- [**vLLM 源码学习**](inference-engine/vllm/) —— 从「一个请求的一生」出发，逐层拆解 vLLM v1 的调度、KV Cache、Worker 执行、多机与 PD 分离机制。全套沿用统一示例（A/B 两个请求），建立可贯穿全局的直觉。
+聚焦「请求如何高效地从字符串走到 GPU 再吐字返回」。
+
+- [**vLLM 源码学习**](inference-engine/vllm/) —— 从「一个请求的一生」出发，逐层拆解 vLLM v1 的调度、KV Cache（PagedAttention）、Worker 执行、多机与 PD 分离机制。
+
+- [**SGLang 源码学习**](inference-engine/sglang/) —— 从「数据流贯穿全局」出发，拆解 SGLang（srt）的多进程架构、Scheduler 调度、RadixAttention 前缀缓存、启动参数与单机/多机/PD 分离部署。附 **vLLM ↔ SGLang 机制对照表**，便于横向比较两个引擎的设计取舍。
+
+> 两套笔记均沿用统一示例（A/B 两个共享前缀的请求）。想横向对比，推荐先各读 00 篇，再重点对照 vLLM 的 `03-PagedAttention` 与 SGLang 的 `06-RadixCache`——这是二者最核心的设计分歧点（定长 block + 哈希 vs 变长 key + 基数树）。
 
 ### 调度与编排
 
-- [**Volcano 源码学习**](scheduling/volcano/) —— 从「kube-scheduler 为什么不够用」出发，拆解 Volcano 的 Session/Action/Plugin 三层框架、Gang 调度的事务机制、队列配额与抢占回收、网络拓扑感知与 GPU 共享，并给出训练 + 推理 + 训推混部的完整 Demo。
-- [**Kueue 源码学习**](scheduling/kueue/) —— 从「作业级准入」这一定位出发，拆解 Workload 生命周期、ClusterQueue/Cohort 的借用与借出账本、flavorassigner 与抢占算法、TAS 拓扑感知与 MultiKueue 多集群，并给出训练 + 推理 + 借用回收的完整 Demo。与 Volcano 系列沿用同一示例，可横向对比。
+聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」。
+
+- [**Volcano 源码学习**](scheduling/volcano/) —— Pod 级批调度器：Session/Action/Plugin 框架、Gang 调度事务机制、队列配额、拓扑感知、GPU 共享。
+
+- [**Kueue 源码学习**](scheduling/kueue/) —— 作业级准入控制器：ClusterQueue/Cohort 配额借用、ResourceFlavor 异构机型、TAS 拓扑感知、MultiKueue 多集群。
+
+> 一句话区分：**Kueue 决定「作业什么时候可以开始」，Volcano 决定「Pod 落到哪个节点」**，两者互补可叠加。详见 [scheduling/README](scheduling/README.md)。
 
 ## 使用建议
 
 每个子专题内部一般都有一篇 `00-` 开头的总览文档，建议从它读起，再按编号顺序深入。
+
+全部笔记采用统一的分析范式：
+
+- **统一示例贯穿全局**：每个专题用同一组示例，追踪同一份数据/作业在每一层如何被封装、拆解、变形。
+- **真实源码 + 逐行注释**：摘录真实代码，注释分 `【逻辑】`（系统在做什么、为什么）和 `【Python】`/`【Go】`（语法讲解）两类。
+- **图示优先**：架构图、进程模型图、时序图、状态机图，帮助建立空间直觉。
+- **每篇附速查表**：语法速查 + 必记要点。
+- **刻意横向对照**：同类项目（vLLM ↔ SGLang、Volcano ↔ Kueue）使用一致的示例与结构，便于比较设计取舍。
