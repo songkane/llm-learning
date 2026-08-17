@@ -1,6 +1,6 @@
 # kube-scheduler 总览与架构
 
-> 本篇回答：**K8s 原生调度器做什么、由哪些部分组成、一个 Pod 从创建到落到节点上经过了什么**，以及一个很多人还不知道的重大变化 —— **v1.36 已经把 gang 调度和拓扑感知调度做进了主干**。
+> 本篇回答：**K8s 原生调度器做什么、由哪些部分组成、一个 Pod 从创建到落到节点上经过了什么。**
 >
 > **源码基线：`kubernetes/kubernetes` v1.36.3**（最新稳定 release）
 >
@@ -10,7 +10,9 @@
 > git describe --tags        # v1.36.3
 > ```
 >
-> 与本仓库 Volcano / Kueue 系列沿用同一示例，便于三方横向对比。版本差异见 [附录：版本说明](#附录版本说明)。
+> **本系列的组织方式**：00~03 篇是**通用原理**，只讲调度器本身怎么工作，用普通工作负载做例子；04 篇起才进入特定场景（大模型训练/推理）分析它的能力与短板；06~07 篇讲怎么扩展它。如果你是为了解决某个具体场景问题而来，也建议先读完 00~01 建立地基。
+>
+> 版本差异见 [附录：版本说明](#附录版本说明)。
 
 ---
 
@@ -18,9 +20,18 @@
 
 > kube-scheduler 是一个**为单个 Pod 选择节点**的控制器：从调度队列取出一个 Pod，过滤出可行节点，打分选最优，然后把 `pod.spec.nodeName` 写回 apiserver。
 
-它的经典设计假设是「**Pod 之间彼此独立**」。这个假设让它极其可扩展（能撑 5000 节点 / 15 万 Pod），也是 Volcano、Kueue 这类项目存在的理由。
+一句话概括它的职责边界：
 
-**但从 v1.36 开始，这个假设不再是全部事实**：
+| 它做 | 它不做 |
+|------|--------|
+| 决定 Pod 放在**哪个节点** | 决定 Pod **能不能创建**（那是 ResourceQuota / admission 的事） |
+| 基于 `requests` 做资源账本 | 关心容器实际用了多少（那是 kubelet / VPA 的事） |
+| 写 `pod.spec.nodeName` | 拉镜像、起容器（那是 kubelet 的事） |
+| 优先级抢占 | 保证 Pod 一直运行（那是 controller 的事） |
+
+它的核心设计假设是「**Pod 之间彼此独立**」—— 每个 Pod 独立决策、互不影响。这个假设让它极其可扩展（官方规模目标 5000 节点 / 15 万 Pod），也是它一切能力与局限的根源。
+
+**一个反直觉的事实**：从 v1.36 开始，主干代码里出现了「成组调度」的分支：
 
 ```go
 // pkg/scheduler/schedule_one.go
@@ -30,65 +41,64 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
     if sched.genericWorkloadEnabled && podInfo.Pod.Spec.SchedulingGroup != nil {
         podGroupInfo, err := sched.podGroupInfoForPod(ctx, podInfo)
         ...
-        sched.scheduleOnePodGroup(ctx, podGroupInfo)     // ★ 成组调度分支
+        sched.scheduleOnePodGroup(ctx, podGroupInfo)     // 成组调度分支
     } else {
         sched.scheduleOnePod(ctx, podInfo)               // 经典的逐 Pod 分支
     }
 }
 ```
 
-主干里已经有了 `pkg/scheduler/schedule_one_podgroup.go`（600+ 行）、`gangscheduling` 插件、`topologyaware` 插件、`PodGroup` API（`scheduling.k8s.io/v1alpha2`）、以及 workload 级抢占。
+不过 `genericWorkloadEnabled` 对应的 feature gate **默认关闭**，所以**默认行为仍然是逐 Pod 调度**。本篇 §6 客观介绍这条新路径的存在与结构，它的适用性与取舍留到 [04 篇](04-面向大模型场景的能力与局限.md) 讨论。
 
-**不过全部是 Alpha 且默认关闭**，所以「默认行为」仍然是逐 Pod 调度。这个区分非常重要，本篇 §6 专门讲。
+### 1.1 贯穿全篇的示例
 
-### 1.1 统一示例（三系列共用）
+00~03 篇统一用这个**普通集群**做例子（04 篇起换成 GPU 集群，与 Volcano/Kueue 系列对齐）：
 
-8 台机器、每台 8 卡 A100（共 64 卡），跑三类负载：
+6 个节点，每台 8 核 16 Gi：
 
-- **作业 T**（训练）：8 个 Pod、每个 8 卡，**必须同时起来**（NCCL 通信域）。
-- **作业 S**（推理）：vLLM，TP=4，2 个副本，希望每副本 4 卡同机。
-- **作业 D**（调试）：1 个 4 卡 Pod，随时提交。
+| 节点 | CPU 空闲 | 内存空闲 | 特点 |
+|------|---------|---------|------|
+| node-1 | 0.5 / 8 | 1 / 16 Gi | 已被占满 |
+| node-2 | 1 / 8 | 2 / 16 Gi | 快满了 |
+| node-3 | 8 / 8 | 16 / 16 Gi | 空闲，但有污点 `maintenance=true:NoSchedule` |
+| node-4 | 6 / 8 | 12 / 16 Gi | 空闲 |
+| node-5 | 6 / 8 | 12 / 16 Gi | 空闲 |
+| node-6 | 6 / 8 | 12 / 16 Gi | 空闲，**已缓存应用镜像** |
 
-用**默认配置的 kube-scheduler** 跑这三个负载，会发生什么：
+负载：一个 `web` Deployment（3 副本，每个 2 核 4 Gi，挂 PVC）。
 
-| 负载 | 结果 | 根因 |
-|------|------|------|
-| 作业 T | 起了 5 个 Pod 占 40 卡空转，3 个 Pending 等资源 → **资源死锁** | 逐 Pod 调度，没有「整体」概念 |
-| 作业 S | 4 个 rank 被打散到 4 台机器，跨机 TCP 通信，吞吐掉几倍 | `PodAffinity` 只能表达亲和倾向，不能表达「这 4 个必须同机且整组同机」 |
-| 作业 D | 正常 | 单 Pod 场景本来就是它的主场 |
-
-这就是为什么 GPU 集群几乎都要在 kube-scheduler 之外再加一层。
+用它可以观察到调度器的全部关键行为 —— 资源过滤、污点排除、打分决胜、副本打散、卷绑定。[01 篇 §6](01-核心原理-调度周期与扩展点.md) 会用这个示例把 15 个扩展点完整走一遍并手算分数。
 
 ---
 
-## 2. 与 Volcano / Kueue 的三方定位
+## 2. 它的边界：与 Volcano / Kueue 的分工
 
-| 维度 | **kube-scheduler** | **Kueue** | **Volcano** |
-|------|-------------------|-----------|-------------|
-| 层次 | Pod 级**调度**（选节点 + Bind） | 作业级**准入** | Pod 级**调度**（替代 kube-scheduler） |
-| 调度单元 | 一个 Pod（v1.36 Alpha 起可为 PodGroup） | Workload（PodGroup 的申请单） | PodGroup |
-| 执行手段 | 写 `pod.spec.nodeName` | 改 `job.spec.suspend` / 摘 scheduling gate | 写 `pod.spec.nodeName` |
-| 多租户配额 | ❌（只有 namespace `ResourceQuota`，硬上限不可借） | ✅ ClusterQueue + Cohort 借用 | ✅ Queue + deserved/capability |
-| Gang | v1.36 Alpha（`GangScheduling` gate） | ✅ 结构性保证 | ✅ Statement 事务 |
-| 拓扑感知 | v1.36 Alpha（`TopologyAwareWorkloadScheduling`） | ✅ TAS | ✅ HyperNode |
-| 节点级打分/过滤 | ✅ **它就是标准** | ❌ 不做 | ✅（复用 kube-scheduler 的插件代码） |
-| GPU 共享 | ❌（整卡整数分配；DRA 提供了更细的设备模型但不做显存切分） | ❌ | ✅ deviceshare vGPU |
-| 抢占 | ✅ 优先级抢占（单 Pod 视角） | ✅ 配额回收 | ✅ 队列内 + 跨队列 |
-| 是否可共存 | — | Kueue 放行后由它调度 | 与它并存（按 `schedulerName` 分流） |
-
-**三者的关系可以这样理解**：
+读原生调度器时容易产生的疑问是「那为什么还有 Volcano、Kueue」。一句话划清边界：
 
 ```mermaid
 flowchart LR
     A["作业提交"] --> B["Kueue：够配额吗？<br/>（作业级准入）"]
     B -->|放行| C{"schedulerName?"}
     C -->|default-scheduler| D["kube-scheduler<br/>逐 Pod 选节点"]
-    C -->|volcano| E["Volcano<br/>成组选节点 + GPU 共享"]
+    C -->|volcano| E["Volcano<br/>成组选节点"]
     D --> F["kubelet 拉起容器"]
     E --> F
 ```
 
-> kube-scheduler 是**地基**：Volcano 复用了它的插件代码（`predicates`/`nodeorder` 插件 import 了 `k8s.io/kubernetes/pkg/scheduler/framework/plugins`），Kueue 则把 Pod 交还给它调度。**读懂 kube-scheduler 是读懂另外两个的前提。**
+| | **kube-scheduler** | **Kueue** | **Volcano** |
+|--|-------------------|-----------|-------------|
+| 层次 | Pod 级**调度**（选节点 + Bind） | 作业级**准入** | Pod 级**调度**（替代 kube-scheduler） |
+| 执行手段 | 写 `pod.spec.nodeName` | 改 `job.spec.suspend` / 摘 scheduling gate | 写 `pod.spec.nodeName` |
+| 多租户配额 | ❌ 只有 `ResourceQuota`（硬上限、不可借用、超出直接拒绝创建） | ✅ | ✅ |
+| 节点级过滤/打分 | ✅ **它就是标准** | ❌ 不做 | ✅（复用 kube-scheduler 的插件代码） |
+| 是否可共存 | — | Kueue 放行后由它调度 | 与它并存（按 `schedulerName` 分流） |
+
+两个要点：
+
+1. **kube-scheduler 与 Volcano 是互斥的**，由 `pod.spec.schedulerName` 决定归属，同一个 Pod 只会被一个调度器决策和 Bind。
+2. **它是地基**：Volcano 的 `predicates` / `nodeorder` 插件直接 import 了 `k8s.io/kubernetes/pkg/scheduler/framework/plugins`，Kueue 则把 Pod 交还给它调度。**读懂 kube-scheduler 是读懂另外两个的前提。**
+
+完整的三方能力矩阵与选型建议见 [04 篇 §5](04-面向大模型场景的能力与局限.md) 与 [scheduling/README](../README.md)。
 
 ---
 
@@ -277,20 +287,35 @@ type PriorityQueue struct {
 
 老版本的问题：一个 Pod 因为「CPU 不够」进了 `unschedulablePods`，那么**任何** Pod 删除事件都会把它拉回 activeQ 重试 —— 大量无效调度。
 
-QueueingHint 让插件对「这个事件对我这个失败原因有意义吗」表态。以 gang 插件为例：
+QueueingHint 让插件对「这个事件对我这个失败原因有意义吗」表态。以 `NodeResourcesFit` 为例，别的 Pod 缩容时它会判断「腾出来的资源是不是我缺的那种」：
 
 ```go
-// plugins/gangscheduling/gangscheduling.go
-func (pl *GangScheduling) isSchedulableAfterPodAdded(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
-    _, addedPod, err := util.As[*v1.Pod](oldObj, newObj)
-    if err != nil { return fwk.Queue, err }
-
-    if !helper.MatchingSchedulingGroup(pod, addedPod) {
-        return fwk.QueueSkip, nil       // ★ 新增的 Pod 不是我的同伴 → 别叫我
+// plugins/noderesources/fit.go
+func (f *Fit) isSchedulableAfterPodScaleDown(targetPod, originalPod, modifiedPod *v1.Pod) bool {
+    if modifiedPod.Spec.NodeName == "" {
+        // If the update event is for a unscheduled Pod, it wouldn't make targetPod schedulable.
+        return false                      // ★ 没落到节点上的 Pod 缩容，不释放任何资源
     }
-    return fwk.Queue, nil               // 是同伴 → 可能凑够 gang 了，重试
+    ...
+    podRequests := resource.PodRequests(targetPod, opts)
+    for rName, rValue := range podRequests {
+        if rValue.IsZero() {
+            // We only care about the resources requested by the pod we are trying to schedule.
+            continue                      // ★ 只关心「我请求了的」资源维度
+        }
+        switch rName {
+        case v1.ResourceCPU:
+            if originalMaxResourceReq.MilliCPU > modifiedMaxResourceReq.MilliCPU {
+                return true               // CPU 确实被释放了 → 值得重试
+            }
+        ...
+        }
+    }
+    return false                          // ★ 释放的不是我缺的资源 → 别叫我
 }
 ```
+
+这个判断很典型：一个只缺 CPU 的 Pod，不会因为「别人释放了内存」而被唤醒。
 
 `SchedulerQueueingHints` 在 **v1.34 已 GA 并 LockToDefault**，也就是说这个机制现在是不可关闭的标准行为。
 
@@ -303,9 +328,9 @@ func (pl *GangScheduling) isSchedulableAfterPodAdded(logger klog.Logger, pod *v1
 
 ---
 
-## 6. v1.36 的重大变化：workload-aware scheduling
+## 6. v1.36 新增的成组调度路径（Alpha）
 
-**这是本系列最值得关注的部分**，也是很多资料还没覆盖的。
+§1 提到的 `scheduleOnePodGroup` 分支，这里说明它由什么组成。**默认关闭，不影响默认行为** —— 了解它的价值在于知道社区的演进方向，以及读代码时不会被这些新文件搞晕。
 
 ### 6.1 涉及的 feature gates（全部 Alpha，默认关闭）
 
@@ -350,74 +375,38 @@ GenericWorkload（基础：Workload / PodGroup API）
 | `PlacementGenerate` / `PlacementScore` 扩展点 | `staging/.../framework/interface.go` | 全新的两个扩展点 |
 | `scheduleOnePodGroup` | `schedule_one_podgroup.go` | PodGroup 调度周期 |
 
-### 6.3 gang 是怎么实现的
+### 6.3 成组语义靠哪两个扩展点实现
 
-`GangScheduling` 插件只用了两个扩展点：
+`GangScheduling` 插件没有引入任何新机制，只是组合了前面讲过的两个扩展点：
 
-**① `PreEnqueue`：人没到齐就不进队列**
+| 扩展点 | 判断 | 返回 |
+|--------|------|------|
+| `PreEnqueue` | 同组 Pod 数量 < `minCount`？ | `UnschedulableAndUnresolvable` —— 人没到齐，整组都不进队列 |
+| `Permit` | 已调度的同组 Pod < `minCount`？ | `Wait` + 超时；同时 `Activate` 同组未调度的 Pod 加速凑齐 |
 
-```go
-func (pl *GangScheduling) PreEnqueue(ctx context.Context, pod *v1.Pod) *fwk.Status {
-    if pod.Spec.SchedulingGroup == nil { return nil }
-    podGroup, err := pl.podGroupLister.PodGroups(namespace).Get(*schedulingGroup.PodGroupName)
-    if err != nil {
-        if apierrors.IsNotFound(err) {
-            return fwk.NewStatus(fwk.UnschedulableAndUnresolvable,
-                fmt.Sprintf("waiting for pods's pod group %q to appear in scheduling queue", ...))
-        }
-        ...
-    }
-    policy := podGroup.Spec.SchedulingPolicy
-    if policy.Gang == nil { return nil }        // 不是 gang 策略，放过
-
-    podGroupState, err := pl.podGroupManager.PodGroupStates().Get(namespace, *schedulingGroup.PodGroupName)
-    allPodsCount := podGroupState.AllPodsCount()
-    if allPodsCount < int(policy.Gang.MinCount) {
-        return fwk.NewStatus(fwk.UnschedulableAndUnresolvable,
-            "waiting for minCount pods from a gang to appear in scheduling queue")
-    }
-    return nil                                  // 达到 quorum，允许入队
-}
-```
-
-**② `Permit`：凑够 minCount 才一起放行**
+凑够 `minCount` 后，`Permit` 遍历同组所有等待者放行：
 
 ```go
-func (pl *GangScheduling) Permit(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) (*fwk.Status, time.Duration) {
-    ...
-    scheduledPodsCount := podGroupState.ScheduledPodsCount()
-    if scheduledPodsCount < int(policy.Gang.MinCount) {
-        // 顺手把同组还没调度的 Pod 激活，加速凑齐
-        unscheduledPods := podGroupState.UnscheduledPods()
-        pl.handle.Activate(klog.FromContext(ctx), unscheduledPods)
-        return fwk.NewStatus(fwk.Wait, "waiting for minCount pods from a gang to be scheduled"),
-            permitTimeoutDuration                          // ★ 5 分钟超时
-    }
-
-    // quorum 达成：放行所有在 Permit 上等待的同组 Pod
-    assumedPods := podGroupState.AssumedPods()
-    for podUID := range assumedPods {
-        waitingPod := pl.handle.GetWaitingPod(podUID)
-        if waitingPod != nil {
-            waitingPod.Allow(Name)
-        }
-    }
-    return nil, 0
+// plugins/gangscheduling/gangscheduling.go
+if scheduledPodsCount < int(policy.Gang.MinCount) {
+    unscheduledPods := podGroupState.UnscheduledPods()
+    pl.handle.Activate(klog.FromContext(ctx), unscheduledPods)      // 唤醒同伴
+    return fwk.NewStatus(fwk.Wait, "waiting for minCount pods from a gang to be scheduled"),
+        permitTimeoutDuration                                        // ★ 5 分钟，硬编码
 }
+
+// quorum 达成：放行所有在 Permit 上等待的同组 Pod
+for podUID := range podGroupState.AssumedPods() {
+    if waitingPod := pl.handle.GetWaitingPod(podUID); waitingPod != nil {
+        waitingPod.Allow(Name)
+    }
+}
+return nil, 0
 ```
 
-`permitTimeoutDuration = 5 * time.Minute`。这就是经典的 coscheduling 实现套路（与社区 `scheduler-plugins` 的 coscheduling 同源），现在进了主干。
+这是经典的 coscheduling 套路（与社区 `scheduler-plugins` 的 coscheduling 同源），现在进了主干。
 
-**与 Volcano 的 gang 对比**：
-
-| | kube-scheduler v1.36 | Volcano |
-|--|---------------------|---------|
-| 机制 | `Permit` 让先到的 Pod **挂起等待**，凑够 minCount 一起 `Allow` | `Statement` 累积后 `JobReady` 才 `Commit`，否则整体 `Discard` |
-| 等待期间 | Pod 已 assume（**占着缓存里的资源**），在 Permit 阶段挂起 | Pod 未 Bind，资源在快照里被回滚释放 |
-| 超时 | 5 分钟硬编码 | 无（每轮重算） |
-| 死锁风险 | Permit 挂起期间占资源，多个 gang 互等可能死锁（靠超时解） | Discard 立即释放，无死锁 |
-
-> 这解释了为什么 Volcano 的事务式设计更适合大规模：**Permit 等待期间是占着资源的**，而 Volcano 的 Discard 是真正释放。
+**一个值得留意的结构性事实**：`Permit` 返回 `Wait` 时，Pod 已经在上一步 `assume` 过了 —— 等待期间它占着缓存里的资源（[01 篇 §4.3](01-核心原理-调度周期与扩展点.md)）。这也是为什么必须有 `permitTimeoutDuration` 兜底。这个设计的影响见 [04 篇 §4](04-面向大模型场景的能力与局限.md)。
 
 ### 6.4 拓扑感知：Placement 机制
 
@@ -444,7 +433,7 @@ func (sched *Scheduler) podGroupSchedulingPlacementAlgorithm(...) podGroupAlgori
 }
 ```
 
-**这个「逐候选域 dry-run + 回滚 + 选最优」的模式，和 Volcano 的 HyperNode 梯度搜索（`allocateForJob` 里 `stmtBackup` / `RecoverOperations`）在思想上完全一致。** 社区显然吸收了 Volcano/Kueue 的经验。
+**这是一个「逐候选域 dry-run + 回滚 + 选最优」的模式** —— 与前面 15 个扩展点「单 Pod × 单节点」的粒度完全不同，是扩展点粒度上的质变（对应 `PlacementGenerate` / `PlacementScore` 两个新扩展点，见 [06 篇 §11](06-扩展实战-自定义调度插件开发.md)）。
 
 ### 6.5 workload 级抢占
 
@@ -465,15 +454,18 @@ func (sched *Scheduler) runWorkloadAwarePreemption(...) *fwk.Status {
 }
 ```
 
-注意那个限制：**带拓扑约束的 PodGroup 暂不支持 workload 抢占** —— 与 Volcano「带 `networkTopology` 的作业不走 preempt」的限制惊人地一致。同一个难题。
+注意那个限制：**带拓扑约束的 PodGroup 暂不支持 workload 抢占**（`if pg.Spec.SchedulingConstraints != nil && len(...Topology) > 0` 直接返回 `Unschedulable`）。「成组抢占」与「拓扑约束」的组合本身是个难题 —— 要同时满足「驱逐后能凑齐整组」和「整组落在同一拓扑域」，搜索空间过大。
 
-### 6.6 该不该现在用？
+### 6.6 小结
 
 | | 说明 |
 |--|------|
-| ✅ 值得关注 | 方向明确：社区在把 gang / 拓扑 / workload 抢占标准化 |
-| ⚠️ 暂不适合生产 | Alpha 默认关闭、API `v1alpha2`、5 分钟硬编码超时、无多租户配额 |
-| 🔧 现在的选择 | 配额 → Kueue；节点级成组与 GPU 共享 → Volcano |
+| 代码位置 | `schedule_one_podgroup.go`、`plugins/{gangscheduling,topologyaware,podgrouppodscount}/` |
+| 触发条件 | `pod.spec.schedulingGroup != nil` 且对应 gate 开启 |
+| 成熟度 | 全部 **Alpha 默认关闭**，API 为 `v1alpha2` |
+| 对默认行为的影响 | **无** —— gate 不开则 `ScheduleOne` 永远走 `scheduleOnePod` 分支 |
+
+这条路径适合什么场景、与现有方案（Volcano / Kueue）如何取舍，见 [04 篇 §4](04-面向大模型场景的能力与局限.md)。
 
 ---
 
@@ -527,24 +519,31 @@ func applyFeatureGates(config *v1.Plugins) {
 
 > *"This plugin should come before DefaultPreemption because if there is a problem with a Pod and PostFilter gets called to resolve the problem, it is better to first deallocate an idle ResourceClaim than it is to evict some Pod that might be doing useful work."*
 
-**GPU 场景要记住的两个权重问题**：
+**关于权重要记住的两点**：
 
-- 默认 `NodeResourcesFit` 权重只有 1，且默认策略是 `LeastAllocated`（打散）。GPU 集群通常想要**装箱**（`MostAllocated`），需要显式配置。
-- 没有任何插件理解「GPU 卡间 NVLink 拓扑」—— 这是 DRA 和 v1.36 拓扑感知要解决的事。
+- `TaintToleration` 权重最高（3），但它在「没有 `PreferNoSchedule` 污点」的集群里给所有节点固定满分，**实际零区分度**（[01 篇 §6.6](01-核心原理-调度周期与扩展点.md) 有推导）。
+- `NodeResourcesFit` 权重只有 1，且默认策略是 `LeastAllocated`（**打散**）。想要装箱（`MostAllocated`）必须显式配置，且默认只对 CPU / 内存生效。
 
 ---
 
 ## 8. 系列导航
 
+**通用原理**（不绑定任何场景，用普通工作负载举例）：
+
 | 篇 | 主题 | 核心问题 |
 |----|------|---------|
-| 00（本篇） | 总览与架构 | 定位、三方对比、组件、Pod 的一生、v1.36 的 workload-aware 新特性 |
-| [01](01-核心原理-调度周期与扩展点.md) | 调度周期与扩展点 | 15 个扩展点各在什么时候跑、Status 语义、CycleState，**并用统一示例完整 trace 一遍（含逐项分数计算）** |
+| 00（本篇） | 总览与架构 | 定位与职责边界、组件、Pod 的一生、三队列、v1.36 新增的成组路径 |
+| [01](01-核心原理-调度周期与扩展点.md) | 调度周期与扩展点 | 15 个扩展点各在什么时候跑、Status 语义、CycleState，**完整 trace 一个 Pod（含逐项分数计算）** |
 | [02](02-核心代码分析-调度队列与缓存.md) | 调度队列与缓存 | 三队列流转、QueueingHint、Cache 增量快照、assume/forget |
 | [03](03-核心代码分析-过滤打分与抢占.md) | 过滤打分与抢占 | findNodesThatFitPod 的采样与并行、打分归一化、抢占五步 |
-| [04](04-面向大模型场景的能力与局限.md) | 大模型场景 | 默认调度器能做什么、做不到什么、DRA、怎么和 Volcano/Kueue 配合 |
-| [05](05-实战Demo.md) | 实战 Demo | 改配置、装箱策略、拓扑打散、抢占、开 gang gate 实测、排障 |
-| [06](06-扩展实战-自定义调度插件开发.md) | 扩展实战 | **每个扩展点一个可编译 demo**：out-of-tree 注册、CycleState、QueueingHint、Permit-gang、部署与验证 |
+
+**场景与扩展**：
+
+| 篇 | 主题 | 核心问题 |
+|----|------|---------|
+| [04](04-面向大模型场景的能力与局限.md) | 大模型场景 | 换成 GPU 集群示例：能做好什么、做不到什么、DRA、怎么和 Volcano/Kueue 配合 |
+| [05](05-实战Demo.md) | 实战 Demo | 改配置、装箱策略、拓扑打散、抢占、开成组调度 gate 实测、排障 |
+| [06](06-扩展实战-自定义调度插件开发.md) | 扩展实战 | **每个扩展点一个可编译 demo**：out-of-tree 注册、CycleState、QueueingHint、Permit、部署与验证 |
 | [07](07-免编译扩展-Extender与外部扩展点.md) | 免编译扩展 | **不改二进制**的六种方式：Extender(HTTP)、配置层、SchedulingGates、Webhook、DRA、Descheduler，各含部署 Demo |
 
 ---
