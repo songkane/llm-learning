@@ -65,3 +65,9 @@ cd sglang && git checkout v0.5.16
 | 天然优势 | 显存零碎片、实现规整 | 多轮/多分支的层级前缀共享更自然 |
 
 > 详细对照见 [SGLang 00 篇第六节](sglang/00-导读与索引.md)。
+
+## 再往下一层：KV Cache 基础设施
+
+两套笔记的 PD 分离篇（vLLM 05 / SGLang 05）都停在「KV 通过 RDMA 传给 Decode 实例」；SGLang 的 RadixCache 也只活在**单实例 GPU 显存**里。这两个缺口由 [`kvcache/`](../kvcache/) 分类补上：
+
+- [**Mooncake 源码学习**](../kvcache/mooncake/) —— KV 怎么跨实例搬运（Transfer Engine）、怎么跨实例与跨重启共享（Mooncake Store）。沿用同一组 A/B 请求示例，可直接与本目录笔记对照。
