@@ -1,6 +1,6 @@
 # 实战 Demo
 
-> 从零跑通：安装 → 配额体系 → 批作业 → 分布式训练（JobSet + TAS）→ 推理服务（LWS）→ 跨队列借用与回收 → 部分准入 → 排障。
+> 从零跑通：安装 → 配额体系 → 批作业 → 分布式训练（JobSet + TAS）→ 推理服务（LWS）→ RayJob 嵌套对象链 → 跨队列借用与回收 → 部分准入 → 排障。
 >
 > 所有 YAML 使用 `kueue.x-k8s.io/v1beta2`，**版本基线 v0.19.1**。GPU 部分需要集群已装 NVIDIA device plugin；没有 GPU 时把 `nvidia.com/gpu` 换成 `cpu` 也能完整验证配额逻辑。
 
@@ -73,6 +73,7 @@ integrations:
   - leaderworkerset.x-k8s.io/leaderworkerset
   - kubeflow.org/pytorchjob
   - ray.io/rayjob
+  # - ray.io/raycluster                # ★ 只管 RayJob 时不要开，见第 5 节 §5.9
   - pod
 waitForPodsReady:
   enable: true
@@ -85,7 +86,7 @@ waitForPodsReady:
     backoffBaseSeconds: 120
     backoffMaxSeconds: 1800
 fairSharing:
-  enable: false                        # 先用经典抢占，第 6 节再开
+  enable: false                        # 先用经典抢占，第 7 节再开
 featureGates:
   TopologyAwareScheduling: true        # 0.14+ 已默认开，这里显式声明
 ```
@@ -262,7 +263,7 @@ team-a 实际可用上限 = min(nominal + borrowingLimit, 12 + cohort可用)
                     实测以 status.flavorsUsage 为准
 ```
 
-> 不用死记公式，直接跑第 5 节的借用 Demo 观察 `status.flavorsUsage[].resources[].borrowed` 就能验证。
+> 不用死记公式，直接跑第 6 节的借用 Demo 观察 `status.flavorsUsage[].resources[].borrowed` 就能验证。
 
 ---
 
@@ -536,9 +537,375 @@ kubectl -n team-b get pod | head
 
 ---
 
-## 5. Demo D：跨队列借用与回收
+## 5. Demo D：RayJob（多 PodSet 与嵌套对象链）
 
-### 5.1 让 team-a 借用 team-b 的配额
+> 前三个 Demo 里对象与 Pod 基本是一层关系。RayJob 不同：它是 `RayJob → RayCluster → Pod` 再加一个旁路 submitter Job 的**嵌套对象链**，而且 Kueue 会为它生成**三个 PodSet**（其中一个用户在 YAML 里根本看不见）。
+>
+> 这是验证 **jobframework 祖先查找**（03 篇 §4.4）、**多 PodSet 的 gang 语义**（02 篇 §3.1）、**中间产物全链路**最好的例子。
+>
+> 涉及源码：`pkg/controller/jobs/rayjob/{rayjob_controller,rayjob_webhook}.go`、`pkg/controller/jobs/raycluster/`
+
+前置：
+
+```bash
+# 安装 KubeRay operator
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+helm install kuberay-operator kuberay/kuberay-operator --version 1.2.2
+```
+
+并确保 Configuration 的 `integrations.frameworks` 含 `ray.io/rayjob`（§0.3 已配）。
+
+### 5.1 提交对象
+
+```yaml
+# rayjob-demo.yaml
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: llm-eval
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: default          # ★ 接入 Kueue，唯一必填
+    kueue.x-k8s.io/priority-class: low
+spec:
+  shutdownAfterJobFinishes: true                # ★ Kueue 强制要求 true，否则 webhook 拒绝
+  submissionMode: K8sJobMode                    # 默认值，会额外产生一个 submitter PodSet
+  entrypoint: python /home/ray/samples/eval.py
+  # clusterSelector: {}                         # ★ 绝对不能填，与 rayClusterSpec 互斥
+  rayClusterSpec:
+    rayVersion: '2.9.0'
+    headGroupSpec:
+      rayStartParams: {dashboard-host: '0.0.0.0'}
+      template:
+        metadata:
+          annotations:
+            kueue.x-k8s.io/podset-preferred-topology: cloud.provider.com/topology-rack
+        spec:
+          containers:
+          - name: ray-head
+            image: rayproject/ray:2.9.0
+            resources:
+              requests: {cpu: "4", memory: 16Gi}
+              limits:   {cpu: "4", memory: 16Gi}
+    workerGroupSpecs:
+    - groupName: gpu-workers                    # ★ 这个名字会直接变成 PodSet 名
+      replicas: 4
+      minReplicas: 4                            # ★ 必须 = replicas = maxReplicas，见 §5.9
+      maxReplicas: 4
+      numOfHosts: 1                             # >1 时 count = replicas × numOfHosts
+      template:
+        metadata:
+          annotations:
+            kueue.x-k8s.io/podset-preferred-topology: cloud.provider.com/topology-rack
+        spec:
+          containers:
+          - name: ray-worker
+            image: rayproject/ray:2.9.0
+            resources:
+              limits: {nvidia.com/gpu: 2, cpu: "8", memory: 64Gi}
+```
+
+```bash
+kubectl apply -f rayjob-demo.yaml
+```
+
+### 5.2 阶段①：webhook
+
+Webhook 路径 `/mutate-ray-io-v1-rayjob`（create）与 `/validate-ray-io-v1-rayjob`（create + update），`failurePolicy: fail`。
+
+**Defaulting 四步**（`rayjob_webhook.go` → `Default()`）：
+
+| 步骤 | 函数 | 产物 |
+|------|------|------|
+| 1 | `ApplyDefaultLocalQueueWithManagedJobsNamespaceSelector` | 补 `kueue.x-k8s.io/queue-name` 标签（命名空间受管且存在默认 LocalQueue 时） |
+| 2 | `ApplyDefaultWorkloadPriorityClass` | 补默认 WorkloadPriorityClass |
+| 3 | `ApplyDefaultForSuspend` | **`spec.suspend = true`** ← 执行开关 |
+| 4 | `ApplyDefaultForManagedBy` | MultiKueue 开启时设 `spec.managedBy` |
+
+**RayJob 专属校验**（`validateCreate`，仅在受 Kueue 管理时执行）：
+
+| 组合 | 结果 |
+|------|------|
+| `clusterSelector` 非空 + `rayClusterSpec` 非空 | ❌ `a kueue managed job should not use an existing cluster` |
+| `clusterSelector` 非空 + `rayClusterSpec` nil | ✅ 合法，但 `Skip()` 返回 true → **完全脱离 Kueue 管理** |
+| `clusterSelector` 空 + `rayClusterSpec` nil | ❌ `rayClusterSpec is required for Kueue-managed jobs...` |
+| `clusterSelector` 空 + `rayClusterSpec` 非空 | ✅ 继续 `raycluster.ValidateCreate` + TAS 注解校验 |
+| `shutdownAfterJobFinishes != true` | ❌ `a kueue managed job should delete the cluster after finishing` |
+
+最后一条是 RayJob 独有的硬约束：集群不销毁 = Pod 不退出 = Workload 不 Finished = **配额永不释放**。
+
+```bash
+# 此刻只有 RayJob，下游对象一个都没有
+kubectl -n team-a get rayjob,raycluster,job,pod
+# NAME                       JOB STATUS   DEPLOYMENT STATUS
+# rayjob.ray.io/llm-eval                  Suspended      ← KubeRay 看到 suspend=true 就停手
+```
+
+### 5.3 阶段②：PodSets() 翻译成三个 PodSet
+
+`RayJob.PodSets()` 走四步（`rayjob_controller.go`）：
+
+```go
+1. raycluster.BuildPodSets(spec.RayClusterSpec, annotations)   // head + 各 worker group
+2. addSubmitterPodSet(podSets)         // 仅 K8sJobMode，追加名为 "submitter" 的 PodSet
+3. addSidecarSubmitterToHeadPodSet()   // 仅 SidecarMode，往 head PodSet 塞一个容器
+4. raycluster.UpdatePodSets(...)       // 按 autoscaling / 已存在集群状态修正
+```
+
+命名与计数规则：
+
+| 索引 | 名称 | count | 来源 |
+|------|------|-------|------|
+| 0 | `head` | 固定 1 | `headGroupPodSetName` 常量 |
+| 1..n | `<groupName>`，本例 `gpu-workers` | `replicas × max(1, numOfHosts)` = 4 | `workerGroupSpecs[i].GroupName` |
+| **末位** | `submitter` | 1 | 仅 `K8sJobMode`。**顺序约定：submitter 恒在最后**，`RunWithPodSetsInfo` / `RestorePodSetsInfo` 都依赖它 |
+
+`submitter` 的默认资源（用户未提供 `submitterPodTemplate` 时，镜像同 head、`restartPolicy: Never`）：
+
+| | requests | limits |
+|--|---------|--------|
+| cpu | 500m | 1 |
+| memory | 200Mi | 1Gi |
+
+生成的 Workload：
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  name: rayjob-llm-eval-a1b2c            # GetWorkloadNameForOwnerWithGVK：<kind小写>-<name>-<hash>
+  namespace: team-a
+  ownerReferences:
+  - {apiVersion: ray.io/v1, kind: RayJob, name: llm-eval, controller: true}
+  labels: {kueue.x-k8s.io/job-uid: <RayJob UID>}
+  finalizers: [kueue.x-k8s.io/resource-in-use]
+spec:
+  queueName: default
+  priority: 100
+  priorityClassRef: {group: kueue.x-k8s.io, kind: WorkloadPriorityClass, name: low}
+  active: true
+  podSets:                                # ★ 创建后不可变
+  - {name: head,        count: 1, topologyRequest: {preferred: .../topology-rack}, template: {...}}
+  - {name: gpu-workers, count: 4, topologyRequest: {preferred: .../topology-rack}, template: {...}}
+  - {name: submitter,   count: 1, template: {...}}      # ★ 用户 YAML 里看不见的一份配额
+```
+
+聚合出的 `TotalRequests`：
+
+```text
+nvidia.com/gpu : 0    + 4×2    + 0      = 8
+cpu            : 4    + 4×8    + 0.5    = 36.5
+memory         : 16Gi + 4×64Gi + 200Mi ≈ 272.2Gi
+```
+
+### 5.4 阶段③④⑤：入队 → 调度 → 准入
+
+```text
+③ workload controller → qcache：workload.Info（3 个 PodSetResources）推进 team-a 的 heap
+④ scheduler 一轮 schedule()（02 篇 §1.1 六步）：
+     nominate() 对 3 个 PodSet 分别选 flavor
+       head        → a100-ondemand  Fit
+       gpu-workers → a100-ondemand  Fit（TAS 软约束：先试 rack，装不下逐级放宽）
+       submitter   → a100-ondemand  Fit
+     RepresentativeMode = min(Fit, Fit, Fit) = Fit     ← ★ gang 语义
+⑤ admit()：同步写 schdcache 账本 → 异步 patch apiserver
+```
+
+**3 个 PodSet 只要 1 个装不下，整个 RayJob 就不准入** —— 所以 submitter 那 500m CPU 也可能成为压垮骆驼的最后一根稻草（§5.9）。
+
+准入后的 `status`：
+
+```yaml
+status:
+  admission:
+    clusterQueue: team-a
+    podSetAssignments:
+    - name: head
+      count: 1
+      flavors: {cpu: a100-ondemand, memory: a100-ondemand}
+      resourceUsage: {cpu: "4", memory: 16Gi}
+      topologyAssignment:
+        levels: [kubernetes.io/hostname]
+        slices: [{domainCount: 1,
+                  valuesPerLevel: [{individual: {prefix: "gpu-node-", roots: ["0"]}}],
+                  podCounts: {universal: 1}}]
+    - name: gpu-workers
+      count: 4
+      flavors: {cpu: a100-ondemand, memory: a100-ondemand, nvidia.com/gpu: a100-ondemand}
+      resourceUsage: {cpu: "32", memory: 256Gi, nvidia.com/gpu: "8"}
+      topologyAssignment:
+        slices: [{domainCount: 4,
+                  valuesPerLevel: [{individual: {prefix: "gpu-node-", roots: ["0","1","2","3"]}}],
+                  podCounts: {universal: 1}}]
+    - name: submitter
+      count: 1
+      flavors: {cpu: a100-ondemand, memory: a100-ondemand}
+      resourceUsage: {cpu: 500m, memory: 200Mi}
+  conditions:
+  - {type: QuotaReserved, status: "True", reason: QuotaReserved}
+  - {type: Admitted,      status: "True", reason: Admitted}
+```
+
+### 5.5 阶段⑥⑦：放行与对象链展开
+
+```go
+func (j *RayJob) RunWithPodSetsInfo(ctx, c, podSetsInfo []podset.PodSetInfo) error {
+    expectedLen := j.expectedPodSetsCount()          // 1(head) + 1(workerGroup) + 1(submitter) = 3
+    if len(podSetsInfo) != expectedLen {
+        return podset.BadPodSetsInfoLenError(expectedLen, len(podSetsInfo))
+    }
+    j.Spec.Suspend = ptr.To(false)                   // ★ 放行
+    raycluster.UpdateRayClusterSpecToRunWithPodSetsInfo(log, &j.Spec.RayClusterSpec, podSetsInfo)
+    if j.Spec.SubmissionMode == rayv1.K8sJobMode {
+        info := podSetsInfo[expectedLen-1]           // ★ submitter 恒在末位
+        podset.Merge(&template.ObjectMeta, &template.Spec, info)
+        if j.Spec.SubmitterPodTemplate == nil {      // 用户已提供模板时 Merge 已就地改
+            j.Spec.SubmitterPodTemplate = template
+        }
+    }
+}
+```
+
+回写到 RayJob 对象的字段：
+
+| 路径 | 变更 |
+|------|------|
+| `spec.suspend` | `true` → **`false`** |
+| `spec.rayClusterSpec.headGroupSpec.template.spec.nodeSelector` | 注入 `{instance-type: on-demand}` + TAS 域标签 |
+| `spec.rayClusterSpec.workerGroupSpecs[0].template.spec.{nodeSelector,tolerations}` | 同上 |
+| `spec.submitterPodTemplate.spec.nodeSelector` | 注入（K8sJobMode） |
+
+之后 KubeRay 接管，对象链依次展开：
+
+```text
+RayJob(suspend=false)
+   ↓ KubeRay rayjob controller
+RayCluster/llm-eval-raycluster-xxxxx              ← ★ 此刻才被创建
+   ↓ KubeRay raycluster controller
+Pod  llm-eval-raycluster-xxxxx-head-xxxxx           (label ray.io/cluster=...)
+Pod  llm-eval-raycluster-xxxxx-worker-gpu-workers-xxxxx × 4
+   ↓ RayCluster 变 Ready 后
+Job/llm-eval-xxxxx (submitter)  →  Pod llm-eval-xxxxx-xxxxx
+   ↓
+kube-scheduler 按注入的 nodeSelector 落位
+```
+
+Kueue 侧的三点配合：
+
+- reconciler 额外 `Watches(&rayv1.RayCluster{}, EnqueueRequestForOwner(&rayv1.RayJob{}, OnlyControllerOwner()))`，RayCluster 状态变化回灌 RayJob 的 reconcile；
+- `PodsReady()` 判据是 `status.rayClusterStatus.state == Ready`（**不是数 Pod**）；
+- 若同时开了 `ray.io/raycluster` 集成，子 RayCluster 会被 `FindAncestorJobManagedByKueue`（03 篇 §4.4）识别为「祖先 RayJob 已管」而**不再单独生成 Workload**。
+
+### 5.6 对象关系与时序
+
+```mermaid
+flowchart TB
+    RJ["RayJob/llm-eval<br/>label: queue-name=default<br/>spec.suspend: true→false"]
+    WL["Workload/rayjob-llm-eval-a1b2c<br/>ownerRef → RayJob<br/>podSets: head(1)/gpu-workers(4)/submitter(1)"]
+    RC["RayCluster/llm-eval-raycluster-xxxxx<br/>（suspend=false 后才创建）"]
+    SJ["Job/llm-eval-xxxxx<br/>submitter，K8sJobMode 专有"]
+    PH["Pod head ×1"]
+    PW["Pod worker ×4"]
+    PS["Pod submitter ×1"]
+
+    RJ -->|jobframework 创建| WL
+    WL -->|status.admission| RJ
+    RJ -->|KubeRay 创建| RC
+    RJ -->|KubeRay 创建| SJ
+    RC --> PH & PW
+    SJ --> PS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant WH as rayjob webhook
+    participant JR as jobframework<br/>rayjob reconciler
+    participant WL as Workload
+    participant S as scheduler
+    participant KR as KubeRay operator
+    participant KS as kube-scheduler
+
+    U->>WH: apply RayJob (queue-name=default)
+    WH->>WH: validate: shutdownAfterJobFinishes==true?<br/>clusterSelector 与 rayClusterSpec 互斥?
+    WH->>WH: mutate: suspend=true + 默认 LQ/WPC/managedBy
+    WH-->>U: 准入通过
+    Note over KR: 看到 suspend=true<br/>jobDeploymentStatus=Suspended<br/>★ 不创建 RayCluster
+
+    JR->>JR: PodSets(): BuildPodSets + addSubmitterPodSet
+    JR->>WL: 创建 Workload<br/>head(1) / gpu-workers(4) / submitter(1)
+
+    S->>S: Heads → Snapshot → nominate
+    S->>S: 3 个 PodSet 全 Fit（取 min）
+    S->>WL: admission + QuotaReserved/Admitted=True
+
+    WL->>JR: 触发 reconcile
+    JR->>JR: RunWithPodSetsInfo：<br/>注入 nodeSelector×3 + suspend=false
+    JR->>KR: RayJob 更新
+
+    KR->>KR: 创建 RayCluster → head+worker Pod
+    KS->>KS: 按 nodeSelector 落位
+    KR->>KR: cluster Ready → 创建 submitter Job
+    Note over WL: PodsReady=True<br/>(rayClusterStatus.state==Ready)
+    KR-->>WL: 作业完成 → shutdown cluster
+    WL->>WL: Finished=True → 释放配额
+```
+
+### 5.7 观测命令
+
+```bash
+# ① Workload 的三个 PodSet（★ 确认 submitter 在，且在末位）
+kubectl -n team-a get workload -o yaml | yq '.items[0].spec.podSets[] | {name, count}'
+# {name: head, count: 1}
+# {name: gpu-workers, count: 4}
+# {name: submitter, count: 1}
+
+# ② 准入结果
+kubectl -n team-a get workload -o yaml | yq '.items[0].status.admission.podSetAssignments'
+
+# ③ 下游对象依次出现
+kubectl -n team-a get rayjob,raycluster,job,pod -w
+
+# ④ 注入痕迹
+kubectl -n team-a get raycluster -o jsonpath='{.items[0].spec.workerGroupSpecs[0].template.spec.nodeSelector}'
+# {"instance-type":"on-demand","kubernetes.io/hostname":"gpu-node-1"}
+
+# ⑤ 配额账本
+kubectl get cq team-a -o yaml | yq '.status.flavorsUsage'
+
+# ⑥ 不准入时
+kubectl -n team-a describe workload | tail -20
+kueuectl list pods --for rayjob/llm-eval
+```
+
+### 5.8 结束与配额释放
+
+```go
+Finished() -> finished = JobDeploymentStatus ∈ {Failed, Complete}
+              success  = JobStatus == Succeeded
+IsActive() -> JobDeploymentStatus ∉ {Suspended, New}
+IsOnHold() -> JobDeploymentStatus == ValidationFailed     // KubeRay 校验失败 → 挂起等待
+```
+
+`shutdownAfterJobFinishes: true` → KubeRay 删 RayCluster → Pod 消失 → Workload 打 `Finished=True` → 摘 finalizer → schdcache 释放 8 卡 → `QueueInadmissibleWorkloads()` 唤醒队列里等着的作业。
+
+### 5.9 RayJob 特有的六个坑
+
+| # | 坑 | 现象 | 处理 |
+|---|----|------|------|
+| 1 | **同时开 `ray.io/raycluster` 集成** | 排障时要同时看两层对象，容易误判 | 只提交 RayJob 时别开；只有独立提交长期 RayCluster 才需要 |
+| 2 | **submitter 的隐形配额** | GPU 明明够，却卡在 `WaitingForQuota` / `NoMatchingFlavor` | `K8sJobMode` 凭空多一个 PodSet（500m CPU / 200Mi）。改 `submissionMode: SidecarMode`（并进 head PodSet，PodSet 数回到 2），或显式给小的 `submitterPodTemplate`。另需确认 CQ 的 `coveredResources` 含 `cpu` |
+| 3 | **`shutdownAfterJobFinishes` 必须 true** | webhook 直接拒绝 | 集群不销毁 = 配额永不释放，这是硬约束 |
+| 4 | **`clusterSelector` 一填就脱管** | RayJob 提交后**没有任何 Workload**，也无报错 | `Skip()` 直接返回 true。看到「没生成 Workload」先查这个字段 |
+| 5 | **autoscaling 与静态配额冲突** | Ray autoscaler 自行增删 worker，账本对不上 | 固定 `replicas == minReplicas == maxReplicas`；要弹性走 Elastic Jobs（03 篇 §7） |
+| 6 | **驱逐还原静默失败** | 换 flavor 后 Pod 上残留旧 nodeSelector | RayJob 未实现 `JobWithCustomStop`，走通用 `Suspend()` + `RestorePodSetsInfo()`；后者数量不匹配时**只打 `V(2)` 日志**「Skipping pod set info restore」并返回 false。运行中改过 `workerGroupSpecs` 数量就会踩到，需 `-v=2` 才看得见 |
+
+---
+
+## 6. Demo E：跨队列借用与回收
+
+### 6.1 让 team-a 借用 team-b 的配额
 
 ```bash
 # team-b 完全空闲，team-a 提交一个超出自己 nominalQuota 的作业
@@ -577,7 +944,7 @@ kubectl get cq team-a -o yaml | yq '.status.flavorsUsage'
 
 **这就验证了 01 篇 §2.2 的冒泡逻辑**：前 12 卡花自留额度，第 13 卡才向 cohort 记账。
 
-### 5.2 team-b 回收自己的配额
+### 6.2 team-b 回收自己的配额
 
 ```bash
 # team-b 提交高优作业，需要 20 卡（它的 nominalQuota）
@@ -638,7 +1005,7 @@ kubectl -n team-a get workload -o yaml | yq '.items[0].status.schedulingStats'
 #     count: 1
 ```
 
-### 5.3 验证「保底」：lendingLimit 生效
+### 6.3 验证「保底」：lendingLimit 生效
 
 ```bash
 # 清理，然后让 team-b 尝试借光 team-a 的配额
@@ -673,9 +1040,9 @@ kubectl get cq team-b -o yaml | yq '.status.flavorsUsage'
 
 ---
 
-## 6. Demo E：部分准入与公平共享
+## 7. Demo F：部分准入与公平共享
 
-### 6.1 PartialAdmission（弹性训练）
+### 7.1 PartialAdmission（弹性训练）
 
 ```yaml
 apiVersion: batch/v1
@@ -710,7 +1077,7 @@ kubectl -n team-a get workload -o yaml | yq '.items[0].status.admission.podSetAs
 
 这条路径对应 02 篇 §3.4 的 `PodSetReducer.Search()`。
 
-### 6.2 打开 Fair Sharing
+### 7.2 打开 Fair Sharing
 
 ```yaml
 # Configuration
@@ -740,9 +1107,9 @@ kubectl get cq team-a -o jsonpath='{.status.fairSharing.weightedShare}'
 
 ---
 
-## 7. 排障手册
+## 8. 排障手册
 
-### 7.1 分层定位法
+### 8.1 分层定位法
 
 ```mermaid
 flowchart TD
@@ -767,7 +1134,7 @@ flowchart TD
     D -->|WaitingForPodsReady| D7["blockAdmission 生效，<br/>前面的作业 Pod 还没 ready"]
 ```
 
-### 7.2 常用命令
+### 8.2 常用命令
 
 ```bash
 # —— Workload 视角（90% 的问题看这里）——
@@ -801,7 +1168,7 @@ kubectl -n kueue-system logs deploy/kueue-controller-manager | grep -E \
 kubectl -n kueue-system logs deploy/kueue-controller-manager | grep -i 'Dump\|snapshot'
 ```
 
-### 7.3 日志关键行对照
+### 8.3 日志关键行对照
 
 调度器 `V(2)` 日志能直接对上 02 篇的六步：
 
@@ -820,11 +1187,13 @@ kubectl -n kueue-system logs deploy/kueue-controller-manager | grep -i 'Dump\|sn
 "Scheduling cycle complete" duration=45ms
 ```
 
-### 7.4 高频问题速查
+### 8.4 高频问题速查
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | Job 提交后没有 Workload | 没打 `kueue.x-k8s.io/queue-name` label；或该类型不在 `integrations.frameworks` | 补 label / 加 integration 后重启 |
+| **RayJob 提交后没有 Workload 且无报错** | 填了 `spec.clusterSelector` → `Skip()` 返回 true，完全脱管 | 删掉 `clusterSelector`，改用 `rayClusterSpec`（§5.9） |
+| **RayJob 的 GPU 够却卡 `WaitingForQuota`** | `K8sJobMode` 的 submitter PodSet 额外占 500m CPU / 200Mi | 改 `SidecarMode`，或给小的 `submitterPodTemplate`；确认 CQ `coveredResources` 含 `cpu`（§5.9） |
 | `QuotaReserved=False, reason=Misconfigured` | `namespaceSelector` 默认 `null` | CQ 写 `namespaceSelector: {}` |
 | `ExceedsMaxQuota` 但集群明显有空闲 | 空闲资源在别的 flavor 上，或 `borrowingLimit` 太小 | 检查 flavor nodeLabels 是否匹配；调 `borrowingLimit` |
 | `NoMatchingFlavor` | Pod 的 nodeSelector/亲和与所有 flavor 都冲突；或 flavor 有 taint 而 Pod 无 toleration | 对齐 label；或给 flavor 配 `tolerations` |
@@ -839,7 +1208,7 @@ kubectl -n kueue-system logs deploy/kueue-controller-manager | grep -i 'Dump\|sn
 | Cohort 里所有队列都不调度了 | Cohort 树成环 | `Snapshot()` 会静默跳过，检查 `parentName` |
 | 改了 Configuration 没生效 | Configuration 不热加载 | `rollout restart deploy/kueue-controller-manager` |
 
-### 7.5 性能观测
+### 8.5 性能观测
 
 ```promql
 # 一轮调度耗时（p99）
@@ -864,7 +1233,7 @@ histogram_quantile(0.5, rate(kueue_quota_reserved_wait_time_seconds_bucket[10m])
 
 ---
 
-## 8. 一页速查表
+## 9. 一页速查表
 
 ```text
 # —— 用户侧（Job / JobSet / LWS / RayJob / Deployment ...）——
@@ -881,6 +1250,15 @@ annotations:
   kueue.x-k8s.io/podset-slice-required-topology: <label> # 子组硬约束（TP）
   kueue.x-k8s.io/podset-slice-size: "4"
   kueue.x-k8s.io/podset-group-name: <group>              # 多 PodSet 同 flavor/域
+
+# —— RayJob 专属（第 5 节）——
+spec.shutdownAfterJobFinishes: true    # ★ 必须，否则 webhook 拒绝
+spec.clusterSelector:                  # ★ 不能填，一填就脱离 Kueue 管理
+spec.submissionMode: K8sJobMode        # 默认，多一个 submitter PodSet（500m CPU/200Mi）
+                     SidecarMode       # submitter 并入 head PodSet
+PodSet 命名：head / <workerGroupSpecs[i].groupName> / submitter（恒在末位）
+PodSet count：head=1，worker=replicas × max(1,numOfHosts)，submitter=1
+replicas == minReplicas == maxReplicas # 否则 autoscaler 与静态配额打架
 
 # —— 管理员侧 ——
 ResourceFlavor: nodeLabels / nodeTaints / tolerations / topologyName
