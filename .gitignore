@@ -2,5 +2,12 @@
 # 不写尾斜杠，这样软链接和真实目录两种形态都能忽略
 /sources
 
+# iCloud 同步冲突产生的副本目录（如 "sources 2"）
+/* [0-9]
+
 # macOS
 .DS_Store
+
+# IDE
+.idea/
+.vscode/
