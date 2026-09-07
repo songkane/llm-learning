@@ -4,13 +4,25 @@
 
 ## 目录
 
+### 调度器（决定 Pod 落在哪 / 作业何时开始）
+
 | 项目 | 目录 | 源码基线 | 定位 | 说明 |
 |------|------|---------|------|------|
 | kube-scheduler | [`kube-scheduler/`](kube-scheduler/) | `v1.36.3` | **K8s 原生 Pod 级调度器** | 一切的地基：调度框架、扩展点、队列与缓存、过滤打分、抢占、DRA，以及 v1.36 新增的原生 gang / 拓扑感知（Alpha） |
 | Volcano | [`volcano/`](volcano/) | `v1.15.1` | **Pod 级批调度器** | CNCF 项目，替代 kube-scheduler：Gang 调度、队列配额、拓扑感知、GPU 共享 |
 | Kueue | [`kueue/`](kueue/) | `v0.19.1` | **作业级准入控制器** | Kubernetes SIG 项目：ClusterQueue/Cohort 配额借用、ResourceFlavor、TAS、MultiKueue |
 
-> 三套文档都**钉在具体 release tag** 而非 master，所有函数名、字段名、代码片段都能在对应 tag 上逐字找到。`git checkout <tag>` 后即可边读边对照。版本差异与升级复查方法见各系列 00 篇的「附录：版本说明」。
+三者在同一个问题域（**资源怎么分给作业**）内互相可比，下面的分工图与能力矩阵只针对它们。
+
+### 自动扩缩容（决定该有几个副本）
+
+| 项目 | 目录 | 源码基线 | 定位 | 说明 |
+|------|------|---------|------|------|
+| llm-d WVA | [`llm-d-autoscaling/`](llm-d-autoscaling/) | `release-0.9 @ d5d5864` | **推理副本数决策器（scale 层）** | 带 LLM 语义（KV token / TTFT-ITL SLO）的自动扩缩容大脑：token 供需双阈值、异构机型成本优化、P/D 联合扩容、缩容到零。产出 `wva_desired_replicas` 指标供 HPA/KEDA 消费 |
+
+WVA 不做 Pod 落位、不做作业准入，**与上面三者不在同一个问题域**，可以完全独立阅读。
+
+> 调度器系列固定到表中 release tag；WVA 按 **`release-0.9 @ d5d5864`** 分析，与 `v0.9.0` tag 相差 3 个提交。源码片段包含省略和教学注释，请按各系列 README 的基线检出后对照对应函数。
 
 ## 建议阅读顺序
 
@@ -23,6 +35,8 @@ Volcano 00  +  Kueue 00   ← 各读一遍总览，理解它们分别补了什�
 ```
 
 **为什么先读 kube-scheduler**：Volcano 直接复用了它的插件实现（`predicates`/`nodeorder` 插件 import 了 `k8s.io/kubernetes/pkg/scheduler/framework/plugins`），Kueue 则把 Pod 交还给它调度。不了解 `Filter`/`Score`/`Permit`/`PreEnqueue` 这套框架，读另外两个会缺一层地基。
+
+**WVA 独立成篇**，与上面的顺序无关，按自己的 00~05 读即可。
 
 ## 三者的分工
 
@@ -110,6 +124,20 @@ flowchart LR
 | [03](kueue/03-核心代码分析-缓存快照与控制器.md) | 缓存与控制器 | 资源账本树、等待队列、jobframework、TAS / MultiKueue / Elastic Jobs |
 | [04](kueue/04-面向大模型训练与推理的能力地图.md) | 大模型能力地图 | 训练/推理/混部，与 Volcano 的三种组合形态 |
 | [05](kueue/05-实战Demo.md) | 实战 Demo | 配额 → JobSet+TAS 训练 → LWS 推理 → 借用回收 → 部分准入 |
+
+## llm-d WVA 学习路线
+
+统一示例：模型 `llama-8b` 的两个变体（`llama-8b-a100` cost 10.0 / `llama-8b-l40s` cost 4.0）+ 一组 P/D 分离变体（`llama-70b-prefill` / `llama-70b-decode`）。
+
+| 篇 | 主题 | 核心问题 |
+|----|------|---------|
+| [00](llm-d-autoscaling/00-WVA总览与架构.md) | 总览与架构 | 什么是「变体」、**变体从注解合成为内存对象**、Reconciler 不做决策、三个 leader-only 轮询循环、V1/V2 与 QM 拒绝路径 |
+| [01](llm-d-autoscaling/01-核心原理-轮询引擎与双阈值容量模型.md) | **双阈值容量模型** | `RC = max(0, demand/0.85 − anticipated)`、`SC = max(0, supply − demand/0.70)`；结构性死区；扩容/缩容的刻意不对称；any-up / all-down 与 liveness 门；**完整数值演算** |
+| [02](llm-d-autoscaling/02-核心代码分析-指标采集与Analyzer.md) | 采集与 Analyzer | 16 条逻辑查询（含 12 条 per-replica，vLLM/SGLang 双后端）、pod→变体映射、**k2 四级链**、throughput `T-sfz`、QM 保留设计 |
+| [03](llm-d-autoscaling/03-核心代码分析-Optimizer与Limiter.md) | Optimizer 与 Limiter | cost-aware vs greedy-by-score、**bindingAnchor / Enabled 投票与 P/D 联合提交**、quota/inventory 限流器、**rescale 优先级水填充**、Enforcer |
+| [04](llm-d-autoscaling/04-面向大模型推理的能力地图.md) | 能力地图 | 能做/做不到、三种落地形态、坑清单、上线检查清单 |
+| [05](llm-d-autoscaling/05-实战Demo.md) | 实战 Demo | kind + 模拟 GPU 跑通全链路，9 个 Demo（含 throughput-only、QM 拒绝与恢复）核对机制，排障决策树 |
+| 📄 [`wva-autoscaling-logic.html`](llm-d-autoscaling/wva-autoscaling-logic.html) | 计算逻辑可视化速查 | 公式字典、指标来源表、数值 Demo、风险清单（浏览器打开） |
 
 ---
 

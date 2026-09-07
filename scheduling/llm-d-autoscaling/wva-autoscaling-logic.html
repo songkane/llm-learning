@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WVA 扩缩容实现逻辑详解</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a21;
+    --panel2: #1e222b;
+    --border: #2a2f3a;
+    --text: #d6dae1;
+    --muted: #8b93a1;
+  --accent: #4f9cf9;
+    --accent2: #7c5cff;
+    --up: #ff7a59;
+    --down: #33c48d;
+    --code-bg: #12151c;
+    --warn: #f5c451;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.7;
+    font-size: 15px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 80px; }
+  header.hero {
+    background: linear-gradient(135deg, #1a1f2e 0%, #12151c 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 48px 24px 40px;
+    text-align: center;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: .5px; }
+  header.hero .sub { color: var(--muted); font-size: 15px; }
+  header.hero .badges { margin-top: 18px; }
+  .badge {
+    display: inline-block; padding: 4px 12px; margin: 4px;
+    border: 1px solid var(--border); border-radius: 20px;
+    font-size: 12px; color: var(--muted); background: var(--panel);
+  }
+  nav.toc {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px 24px; margin: 32px 0;
+  }
+  nav.toc h2 { margin: 0 0 12px; font-size: 16px; color: var(--accent); }
+  nav.toc ol { margin: 0; padding-left: 22px; columns: 2; column-gap: 32px; }
+  nav.toc a { color: var(--text); text-decoration: none; }
+  nav.toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  section { margin: 44px 0; scroll-margin-top: 20px; }
+  h2.sec {
+    font-size: 22px; margin: 0 0 18px; padding-bottom: 10px;
+    border-bottom: 2px solid var(--border);
+  }
+  h2.sec .num {
+    display: inline-block; width: 30px; height: 30px; line-height: 30px;
+    text-align: center; background: var(--accent); color: #fff;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 26px 0 10px; color: #eaeef4; }
+
+  p { margin: 10px 0; }
+  .muted { color: var(--muted); }
+  .lead { font-size: 16px; color: #c3cad4; }
+
+  code.inline {
+    background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 6px; font-size: 13px;
+    color: #ffd479; font-family: "SF Mono", Consolas, monospace;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 16px 18px; overflow-x: auto;
+    font-size: 13px; font-family: "SF Mono", Consolas, monospace;
+    color: #c9d1d9; line-height: 1.6;
+  }
+  pre.formula { border-left-color: var(--accent2); color: #e6d9ff; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 16px 0;
+    font-size: 14px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--panel2); color: var(--accent); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  td code, th code { color: #ffd479; font-family: "SF Mono", Consolas, monospace; font-size: 12.5px; }
+
+  .callout {
+    border-radius: 10px; padding: 14px 18px; margin: 18px 0;
+    border: 1px solid var(--border); background: var(--panel);
+  }
+  .callout.note { border-left: 4px solid var(--accent); }
+  .callout.warn { border-left: 4px solid var(--warn); }
+  .callout.key { border-left: 4px solid var(--accent2); background: #1a1626; }
+  .callout .tag { font-weight: 700; font-size: 12px; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px; }
+  .callout.note .tag { color: var(--accent); }
+  .callout.warn .tag { color: var(--warn); }
+  .callout.key .tag { color: var(--accent2); }
+
+  .pill { padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .pill.up { background: rgba(255,122,89,.15); color: var(--up); }
+  .pill.down { background: rgba(51,196,141,.15); color: var(--down); }
+  .pill.no { background: rgba(139,147,161,.15); color: var(--muted); }
+
+  /* flow diagram */
+  .flow { display: flex; flex-direction: column; gap: 0; margin: 20px 0; }
+  .flow .step {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 18px; position: relative;
+  }
+  .flow .step .stage { color: var(--accent); font-size: 12px; font-weight: 700; letter-spacing: .5px; }
+  .flow .step .desc { font-size: 14px; margin-top: 3px; }
+  .flow .arrow { text-align: center; color: var(--muted); font-size: 18px; line-height: 1; padding: 6px 0; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } nav.toc ol { columns: 1; } }
+
+  .demo-card {
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 4px 20px 16px; margin: 16px 0;
+  }
+  .demo-card h4 { color: var(--accent2); font-size: 15px; margin: 16px 0 8px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 13px; margin-top: 60px; padding-top: 24px; border-top: 1px solid var(--border); }
+
+  .filemap code { color: #7fd6b0; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>WVA 扩缩容实现逻辑详解</h1>
+  <div class="sub">llm-d-autoscaling &nbsp;·&nbsp; release-0.9 @ d5d5864 &nbsp;·&nbsp; 2026-09-07 核对</div>
+  <div class="badges">
+    <span class="badge">轮询式引擎</span>
+ <span class="badge">Token 供需模型</span>
+    <span class="badge">0.85 / 0.70 双阈值</span>
+    <span class="badge">Cost-Aware 优化</span>
+    <span class="badge">HPA / KEDA 下发</span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="callout warn"><strong>版本范围：</strong>本文按 <a href="https://github.com/llm-d/llm-d-autoscaling/tree/d5d586408420fbe0545f827a6ff5dc2f818b16de">release-0.9 @ d5d5864</a> 整理，比 v0.9.0 tag 多 3 个提交。下面的 token 数值示例使用 saturation 投票；throughput-only 使用 token/s 容量。<strong>QM 当前禁用</strong>：配置含 default 会触发 OptimizationRefused，主循环保持目标副本并继续发布指标。</div>
+
+  <nav class="toc">
+    <h2>目录</h2>
+    <ol>
+      <li><a href="#arch">整体设计范式</a></li>
+      <li><a href="#chain">一次 tick 的完整触发链路</a></li>
+      <li><a href="#analyzer">阶段一：Analyzer 算供需</a></li>
+      <li><a href="#threshold">阶段二：触发判定核心公式</a></li>
+      <li><a href="#optimizer">阶段三：Optimizer 换算副本数</a></li>
+      <li><a href="#actuate">阶段四：决策下发</a></li>
+      <li><a href="#fields">公式字段完整字典</a></li>
+      <li><a href="#metrics-source">指标来源（在哪采集）</a></li>
+      <li><a href="#demo">完整扩容 Demo（数值演算）</a></li>
+      <li><a href="#datasource">容量数据来源解析</a></li>
+      <li><a href="#risks">设计要点与潜在风险</a></li>
+      <li><a href="#files">关键文件速查</a></li>
+    </ol>
+  </nav>
+
+  <!-- 1 -->
+  <section id="arch">
+    <h2 class="sec"><span class="num">1</span>整体设计范式</h2>
+    <p class="lead">WVA 与常规 Operator 最大的不同：<strong>Reconciler 不做扩缩容决策，真正的扩缩容跑在独立的定时轮询循环里。</strong></p>
+
+    <div class="callout key">
+      <span class="tag">核心事实</span>
+      <code class="inline">VariantAutoscaling</code> 已不再是真正的 CRD（见 <code class="inline">internal/variant/types.go</code> 头注释）——它是从带
+      <code class="inline">llm-d.ai/managed: "true"</code> 注解的 HPA / KEDA ScaledObject 在<strong>内存中合成的结构体</strong>，从不写入 API server。
+    </div>
+
+    <h3>Reconciler 的职责（不扩缩容）</h3>
+    <table>
+      <tr><th>Reconciler</th><th>职责</th></tr>
+  <tr><td><code>HPAReconciler</code></td><td>把带注解的 HPA 所在命名空间加入跟踪列表（NamespaceTrack/Untrack），缩小后续轮询 List 范围</td></tr>
+      <tr><td><code>ScaledObjectReconciler</code></td><td>同上，针对 KEDA ScaledObject（仅当 KEDA CRD 存在时注册）</td></tr>
+      <tr><td><code>InferencePoolReconciler</code></td><td>维护 datastore 中的 endpoint pool</td></tr>
+      <tr><td><code>ConfigMapReconciler</code></td><td>配置更新；已注册 analyzer 的开关可热生效，首次注册 throughput 需重启；QM 配置含 default 会触发拒绝</td></tr>
+    </table>
+
+    <h3>真正的引擎循环（leader-only）</h3>
+    <p><code class="inline">cmd/main.go</code> 通过 <code class="inline">mgr.Add(RunnableFunc(...))</code> 注册两个引擎循环，由
+      <code class="inline">executor.PollingExecutor</code> 以固定间隔 <code class="inline">OptimizationInterval</code> 驱动（<code class="inline">wait.UntilWithContext</code>，失败指数退避上限 4s）：</p>
+    <table>
+      <tr><th>引擎</th><th>作用</th></tr>
+      <tr><td><code>saturation.Engine.StartOptimizeLoop</code></td><td>主扩缩容引擎（本文重点）</td></tr>
+      <tr><td><code>scalefromzero.Engine.StartOptimizeLoop</code></td><td>专门处理 0→1 冷启动</td></tr>
+    </table>
+    <p class="muted">Prometheus 连不上时 <code class="inline">main.go</code> 直接 <code class="inline">os.Exit(1)</code>——autoscaling 强依赖 metrics，属于合理 fail-fast。</p>
+  </section>
+
+  <!-- 2 -->
+  <section id="chain">
+    <h2 class="sec"><span class="num">2</span>一次 tick 的完整触发链路</h2>
+    <p>每个轮询周期 <code class="inline">Engine.optimize</code> 默认走 V2 路径 <code class="inline">optimizeV2</code>，分四阶段：</p>
+
+  <div class="flow">
+      <div class="step"><div class="stage">TIMER</div><div class="desc">定时器 tick（间隔 = OptimizationInterval）</div></div>
+      <div class="arrow">↓</div>
+      <div class="step"><div class="stage">阶段 1 · COLLECT</div><div class="desc">采集 Prometheus 指标：KV cache 用量、队列长度、生成/请求速率、平均 I/O token、调度器队列</div></div>
+      <div class="arrow">↓</div>
+ <div class="step"><div class="stage">阶段 2a · ANALYZE</div><div class="desc">Analyzer(saturation_v2) 把物理指标转成 token 单位的 <b>供给 / 需求</b></div></div>
+      <div class="arrow">↓</div>
+      <div class="step"><div class="stage">阶段 2b · THRESHOLD</div><div class="desc"><b>applyUniversalThreshold</b> 用 0.85 / 0.70 双阈值算出 <b>RequiredCapacity(扩) / SpareCapacity(缩)</b> ← 触发判定核心</div></div>
+    <div class="arrow">↓</div>
+      <div class="step"><div class="stage">阶段 3 · OPTIMIZE</div><div class="desc">Optimizer 通过 bindingAnchor 选择容量来源，votingResults 过滤投票者；将各自容量缺口 ÷ 各自每副本容量，组合成目标副本数</div></div>
+      <div class="arrow">↓</div>
+      <div class="step"><div class="stage">阶段 4 · ACTUATE</div><div class="desc">applySaturationDecisions 写 Status + 暴露 <b>wva_desired_replicas</b> 指标</div></div>
+   <div class="arrow">↓</div>
+      <div class="step"><div class="stage">EXTERNAL</div><div class="desc">HPA / KEDA 读取指标，实际修改 Deployment 的 replicas</div></div>
+    </div>
+
+    <div class="callout note">
+      <span class="tag">记忆点</span>
+ Analyzer 只算 token 供需 → 引擎用双阈值把供需转成"缺口/富余 token" → Optimizer 把 token 缺口除以每副本容量得到副本增量 → <strong>WVA 只发指标，HPA/KEDA 实际改副本</strong>。
+    </div>
+  </section>
+
+  <!-- 3 -->
+  <section id="analyzer">
+    <h2 class="sec"><span class="num">3</span>阶段一：Analyzer 计算供给与需求</h2>
+    <p>位置 <code class="inline">internal/engines/analyzers/saturation_v2/analyzer.go</code>。把"物理指标"转成"token 单位的供需信号"。</p>
+
+    <h3>3.1 每副本容量 = min(k1, k2)</h3>
+    <div class="grid2">
+      <div class="callout note">
+        <span class="tag">k1 · 内存受限</span>
+        <pre class="formula">k1 = TotalKvCapacityTokens
+        × KvCacheThreshold</pre>
+    <p class="muted">KV 显存能容纳的 token 上界。</p>
+      </div>
+      <div class="callout note">
+        <span class="tag">k2 · 计算受限</span>
+        <p>四级优先级链：<br>P1 观测态 → P2 历史滚动均值 → P3 部署参数推导 → P4 回退 k1。</p>
+ </div>
+    </div>
+ <pre>effectiveCapacity = min(k1, k2)</pre>
+
+    <h3>3.2 每副本需求（偏保守，倾向扩容）</h3>
+    <pre>replicaDemand = TokensInUse + waitingQueueDemand(role)</pre>
+    <p>本地队列请求按 P/D 角色计费：</p>
+    <table>
+<tr><th>角色</th><th>每请求 token 计费</th><th>理由</th></tr>
+      <tr><td>Prefill</td><td><code>AvgInput</code></td><td>只算 prompt KV，输出在别处生成</td></tr>
+      <tr><td>Decode / Both</td><td><code>AvgInput + AvgOutput</code></td><td>用完整输出长度做峰值规划，防止 decode 侧欠配触发抢占重算</td></tr>
+    </table>
+
+    <h3>3.3 调度器队列需求（还没到任何 pod 的排队请求）</h3>
+    <pre class="formula">inputTokens  = max(QueueBytes / BytesPerToken, QueueSize × AvgInput)
+  × (1 − PrefixCacheHitRate)
+outputTokens = QueueSize × AvgOutput
+queueDemand  = inputTokens + outputTokens</pre>
+
+    <h3>3.4 模型级三个总量（Analyzer 的最终输出）</h3>
+    <table>
+      <tr><th>量</th><th>含义</th><th>公式</th></tr>
+    <tr><td><code>TotalSupply</code></td><td>总供给</td><td>Σ ReplicaCount × PerReplicaCapacity</td></tr>
+      <tr><td><code>TotalDemand</code></td><td>总需求</td><td>Σ replicaDemand + queueDemand</td></tr>
+      <tr><td><code>TotalAnticipatedSupply</code></td><td>在途供给</td><td>Σ (ReplicaCount + Pending) × PerReplicaCapacity<br><span class="muted">把 pending 副本计入供给，防止重复扩容</span></td></tr>
+    </table>
+    <div class="callout warn">
+      <span class="tag">注意</span>
+      Analyzer <strong>只产出这三个 token 数字</strong>，本身不判断是否扩缩容。
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section id="threshold">
+    <h2 class="sec"><span class="num">4</span>阶段二：触发判定核心公式</h2>
+    <p>位置 <code class="inline">internal/engines/saturation/engine_v2.go</code> 的 <code class="inline">applyUniversalThreshold</code>。这是<strong>决定扩还是缩</strong>的地方。</p>
+
+    <div class="grid2">
+      <div class="callout note">
+   <span class="tag">RequiredCapacity（扩容信号）</span>
+        <pre class="formula">RC = max(0,
+   TotalDemand / scaleUpThreshold
+   − TotalAnticipatedSupply)</pre>
+        <p><span class="pill up">RC &gt; 0 → 扩容</span></p>
+      </div>
+      <div class="callout note">
+ <span class="tag">SpareCapacity（缩容信号）</span>
+        <pre class="formula">SC = max(0,
+   TotalSupply
+   − TotalDemand / scaleDownBoundary)</pre>
+      <p><span class="pill down">SC &gt; 0 → 允许缩容</span></p>
+      </div>
+    </div>
+
+ <h3>阈值默认值</h3>
+    <table>
+      <tr><th>常量</th><th>默认值</th><th>含义</th></tr>
+      <tr><td><code>scaleUpThreshold</code></td><td><b>0.85</b></td><td>需求超过供给 85% 才扩（要求留 15% headroom）</td></tr>
+      <tr><td><code>scaleDownBoundary</code></td><td><b>0.70</b></td><td>需求跌破供给 70% 才缩</td></tr>
+    </table>
+
+    <div class="callout key">
+      <span class="tag">滞回带 Hysteresis</span>
+      70% ~ 85% 之间形成滞回区间，<strong>系统保持不动，避免临界点反复抖动</strong>。引擎还会校验 <code class="inline">scaleUpThreshold &gt; scaleDownBoundary</code>，不满足则回退默认值。对 P/D 解耦模型，RC/SC 会按 role（prefill / decode）分别计算。
+    </div>
+</section>
+
+  <!-- 5 -->
+  <section id="optimizer">
+    <h2 class="sec"><span class="num">5</span>阶段三：Optimizer 换算副本数</h2>
+    <p>位置 <code class="inline">internal/engines/pipeline/cost_aware_optimizer.go</code>。</p>
+
+    <h3>优化器选择</h3>
+    <table>
+      <tr><th>条件</th><th>优化器</th><th>行为</th></tr>
+      <tr><td>默认 (enableLimiter=false)</td><td><code>CostAwareOptimizer</code></td><td>无限模式，忽略 GPU 配额</td></tr>
+      <tr><td>GPU 受限 (enableLimiter=true)</td><td><code>GreedyByScoreOptimizer</code></td><td>受 GPU 配额约束；无法获取约束时安全回退 cost-aware</td></tr>
+    </table>
+
+    <h3>决策分支</h3>
+    <pre>if anyRoleNeedsScaleUp(...) {   // 任一 role 的 RC &gt; 0
+    allocateForModelPaired(... costGreedyRolePick ...)  // 扩容
+} else {
+    scaleDownRoleIterated(...)   // 否则尝试缩容（需 SC &gt; 0）
+}</pre>
+
+    <h3>token 缺口 → 副本数换算</h3>
+    <pre class="formula">k = max( floor(deltaUtil × RC / PerReplicaCapacity),  min(1, n) )</pre>
+    <div class="grid2">
+      <div class="callout note">
+        <span class="tag up">扩容</span>
+        选<strong>成本效率最高</strong>（<code>cost / PerReplicaCapacity</code> 最小）的变体加副本；受 <code>MaxReplicas</code> headroom 约束；跳过有 pending 的变体。缺口 &gt;0 时<strong>保底至少 +1</strong>。
+      </div>
+      <div class="callout note">
+        <span class="tag down">缩容</span>
+        要求 Enabled 投票集中所有 live analyzer 的 <code>SC &gt; 0</code> 且至少有一个 live 才放行（保守）；从<strong>最贵</strong>变体开始减；受 <code>MinReplicas</code> 约束；保护最便宜变体至少 1 副本。<strong>不做保底 +1</strong>，富余不足一个副本时不缩。
+      </div>
+    </div>
+    <p class="muted">产出 <code class="inline">VariantDecision</code>，Action ∈ { ScaleUp, ScaleDown, NoChange }，由 target vs CurrentReplicas 比较得出。</p>
+  </section>
+
+  <!-- 6 -->
+  <section id="actuate">
+    <h2 class="sec"><span class="num">6</span>阶段四：决策下发（两条路径）</h2>
+
+    <div class="grid2">
+      <div class="callout note">
+        <span class="tag">路径 A · 常规扩缩容（间接，主路径）</span>
+        <ol style="margin:6px 0; padding-left:18px;">
+          <li>写入内存 VA 的 <code>Status.DesiredOptimizedAlloc.NumReplicas</code></li>
+  <li><code>Actuator.EmitMetrics</code> 暴露 gauge <code>wva_desired_replicas</code></li>
+          <li><b>HPA / KEDA</b> 读取该 External Metric，自己改 Deployment replicas</li>
+        </ol>
+        <p class="muted">WVA 本身不直接改 Deployment；即使 NoChange 也照常 emit，保持 HPA 存活。</p>
+   </div>
+      <div class="callout note">
+      <span class="tag">路径 B · Scale-from-zero（直接，0→1）</span>
+        <p><code>scalefromzero.Engine</code> 独立轮询，监测 <code>inference_extension_flow_control_queue_size</code>。有 pending 请求时，通过 <code>DirectActuator</code> 用 client-go/scale <strong>直接改 scale 子资源</strong> 0→1。</p>
+    <p class="muted">因为 HPA 在 0 副本时无 metrics、无法自行拉起。</p>
+      </div>
+ </div>
+  </section>
+
+  <!-- 7 -->
+  <section id="fields">
+    <h2 class="sec"><span class="num">7</span>公式字段完整字典</h2>
+    <p class="lead">按数据流从底层原始指标到顶层决策信号，分六组逐字段说明：<strong>含义 · 单位 · 来源 · 在公式中的作用</strong>。</p>
+
+    <h3>第 1 组 · Prometheus 原始/派生指标（<code class="inline">ReplicaMetrics</code>，每副本一份）</h3>
+    <table>
+      <tr><th>字段</th><th>含义</th><th>单位</th><th>来源</th></tr>
+      <tr><td><code>KvCacheUsage</code></td><td>KV cache 占用率</td><td>0.0–1.0 比例</td><td><code>vllm:kv_cache_usage_perc</code></td></tr>
+      <tr><td><code>NumGpuBlocks</code></td><td>GPU 上分配的 KV block 总数</td><td>个</td><td><code>cache_config_info</code> label（引擎启动 profiling）</td></tr>
+      <tr><td><code>BlockSize</code></td><td>每个 KV block 容纳的 token 数</td><td>token/block</td><td><code>cache_config_info</code> label</td></tr>
+      <tr><td><code>TotalKvCapacityTokens</code></td><td><b>KV cache 总容量</b></td><td>token</td><td>采集器算= <code>NumGpuBlocks × BlockSize</code>（SGLang 直读 max_total_num_tokens）</td></tr>
+      <tr><td><code>TokensInUse</code></td><td>已驻留 KV 的 token 数（已消耗需求）</td><td>token</td><td>派生 = <code>KvCacheUsage × TotalKvCapacityTokens</code></td></tr>
+      <tr><td><code>QueueLength</code></td><td>本地引擎等待队列请求数</td><td>个</td><td><code>vllm:num_requests_waiting</code></td></tr>
+      <tr><td><code>AvgInputTokens</code> (I)</td><td>每请求平均输入 token</td><td>token/请求</td><td><code>rate(prompt_tokens_sum)/rate(count)</code></td></tr>
+      <tr><td><code>AvgOutputTokens</code> (O)</td><td>每请求平均输出 token</td><td>token/请求</td><td><code>rate(generation_tokens_sum)/rate(count)</code></td></tr>
+      <tr><td><code>PrefixCacheHitRate</code></td><td>前缀缓存命中率</td><td>0.0–1.0</td><td>引擎前缀缓存指标</td></tr>
+      <tr><td><code>Cost</code></td><td>每副本成本</td><td>无量纲（默认 10）</td><td>VA spec / 注解</td></tr>
+    </table>
+    <p class="muted">公式里<b>I = AvgInputTokens</b>，<b>O = AvgOutputTokens</b>，是需求估算的两个核心画像参数。</p>
+
+    <h3>第 2 组 · 副本状态（<code class="inline">VariantReplicaState</code>，从 scale target 读）</h3>
+    <table>
+      <tr><th>字段</th><th>含义</th><th>单位</th><th>作用</th></tr>
+      <tr><td><code>CurrentReplicas</code></td><td>当前副本数</td><td>个</td><td>与 target 比较判定 Action</td></tr>
+      <tr><td><code>PendingReplicas</code></td><td>已创建但未 ready 的副本数（Current−Ready）</td><td>个</td><td>计入"在途供给"，防级联扩容</td></tr>
+      <tr><td><code>GPUsPerReplica</code></td><td>每副本 GPU 数</td><td>张</td><td>GPU 配额约束换算</td></tr>
+      <tr><td><code>Role</code></td><td>P/D 解耦角色（prefill/decode/both）</td><td>枚举</td><td>决定队列计费方式、按角色独立扩缩</td></tr>
+      <tr><td><code>MinReplicas</code></td><td>副本下界（nil→0，可缩到 0）</td><td>个</td><td>缩容下限约束</td></tr>
+      <tr><td><code>MaxReplicas</code></td><td>副本上界（nil→0，无上限）</td><td>个</td><td>扩容 headroom 约束</td></tr>
+    </table>
+
+    <h3>第 3 组 · 容量计算字段（Analyzer 内部）</h3>
+    <table>
+      <tr><th>字段/符号</th><th>含义</th><th>单位</th><th>公式 / 说明</th></tr>
+      <tr><td><code>KvCacheThreshold</code></td><td>KV 容量安全水位</td><td>0.0–1.0</td><td>配置，默认 <b>0.80</b>，只用总容量这个比例</td></tr>
+      <tr><td><b><code>k1</code></b></td><td>内存受限容量</td><td>token</td><td><code>TotalKvCapacityTokens × KvCacheThreshold</code></td></tr>
+      <tr><td><b><code>k2</code></b></td><td>计算受限容量</td><td>token</td><td>四级优先级链推导（算力吞吐上界）</td></tr>
+      <tr><td><b><code>effectiveCapacity</code></b></td><td>每副本有效容量</td><td>token</td><td><code>min(k1, k2)</code>，短板决定实际容量</td></tr>
+      <tr><td><b><code>PerReplicaCapacity</code></b></td><td>变体级每副本代表容量</td><td>token</td><td><code>median(各存活实例 effectiveCapacity)</code>，优化器换算的分母</td></tr>
+    </table>
+    <p><b>k2 推导公式（P3 档，estimateCapacityFromParams）：</b></p>
+    <pre class="formula">N_steady = min( B × O / (I + O),  S )
+k2       = N_steady × ( I + O/2 )</pre>
+    <table>
+      <tr><th>符号</th><th>含义</th><th>单位</th><th>来源</th></tr>
+      <tr><td><code>B</code> = EffectiveMaxBatchedTokens</td><td>每步 batch 的 token 预算</td><td>token</td><td><code>--max-num-batched-tokens</code>（默认 V1=8192/V0=2048）</td></tr>
+      <tr><td><code>S</code> = MaxNumSeqs</td><td>最大并发序列数</td><td>个</td><td><code>--max-num-seqs</code>（默认 256）</td></tr>
+      <tr><td><code>I</code> / <code>O</code></td><td>平均输入 / 输出长度</td><td>token</td><td>实时指标</td></tr>
+      <tr><td><code>N_steady</code></td><td>稳态可并发请求数</td><td>个</td><td>中间量，受并发上限 S 截断</td></tr>
+    </table>
+    <p class="muted"><code class="inline">I + O/2</code> 是"稳态平均 KV 占用"（请求从 0 增长到 O，均值取 O/2，加固定的 I）。</p>
+
+    <h3>第 4 组 · 需求估算字段</h3>
+    <p><b>本地队列需求 waitingQueueDemand：</b></p>
+    <pre class="formula">queueDemand_local = QueueLength × { I        (Prefill)
+                                    I + O    (Decode / Both) }</pre>
+    <table>
+      <tr><th>符号</th><th>含义</th><th>为什么这样算</th></tr>
+      <tr><td><code>QueueLength</code></td><td>本地队列请求数</td><td>每个排队请求都会占用容量</td></tr>
+      <tr><td><code>I</code>（Prefill）</td><td>只算输入</td><td>prefill 只材料化 prompt KV，输出在别处生成</td></tr>
+      <tr><td><code>I+O</code>（Decode/Both）</td><td>输入+完整输出</td><td>用峰值（终态 KV 占用）做规划，防欠配</td></tr>
+    </table>
+    <p><b>调度器队列需求 estimateSchedulerQueueDemand（还没到任何 pod 的请求）：</b></p>
+    <pre class="formula">inputTokens  = max( QueueBytes / BytesPerToken,  QueueSize × I ) × (1 − HitRate)
+outputTokens = QueueSize × O
+queueDemand  = inputTokens + outputTokens</pre>
+    <table>
+      <tr><th>符号</th><th>含义</th><th>单位</th><th>来源</th></tr>
+      <tr><td><code>QueueSize</code></td><td>调度器 flow-control 排队请求数</td><td>个</td><td><code>inference_extension_flow_control_queue_size</code></td></tr>
+      <tr><td><code>QueueBytes</code></td><td>排队请求体总字节</td><td>byte</td><td><code>inference_extension_flow_control_queue_bytes</code></td></tr>
+      <tr><td><code>BytesPerToken</code></td><td>字节→token 换算系数</td><td>byte/token</td><td>常量 <b>4</b></td></tr>
+      <tr><td><code>HitRate</code></td><td>前缀缓存命中率</td><td>0.0–1.0</td><td>命中部分复用已有 KV，从输入需求扣除</td></tr>
+    </table>
+    <p class="muted">取 <code class="inline">max(按字节估, 按条数估)</code> 是为鲁棒性——两个独立信号取较大者，避免低估。</p>
+
+    <h3>第 5 组 · 模型级总量与决策信号（喂给判定公式）</h3>
+    <table>
+      <tr><th>字段</th><th>含义</th><th>单位</th><th>公式</th></tr>
+      <tr><td><b><code>TotalSupply</code></b></td><td>总供给</td><td>token</td><td>Σ_v ReplicaCount_v × PerReplicaCapacity_v</td></tr>
+      <tr><td><b><code>TotalDemand</code></b></td><td>总需求</td><td>token</td><td>Σ_v replicaDemand_v + queueDemand</td></tr>
+      <tr><td><b><code>TotalAnticipatedSupply</code></b></td><td>在途供给</td><td>token</td><td>Σ_v (ReplicaCount_v + Pending_v) × PerReplicaCapacity_v</td></tr>
+      <tr><td><b><code>Utilization</code></b></td><td>利用率</td><td>比例</td><td>TotalDemand / TotalSupply</td></tr>
+    </table>
+    <div class="callout key">
+      <span class="tag">关键区别</span>
+      <code class="inline">TotalSupply</code> 只算就绪副本；<code class="inline">TotalAnticipatedSupply</code> 额外把 pending 副本也算作供给。<strong>扩容公式用在途供给做基准</strong>——正在启动的 pod 马上能提供容量，不算进去会重复触发扩容。
+    </div>
+
+    <h4 style="color:#eaeef4;font-size:16px;">触发判定公式的字段</h4>
+    <div class="grid2">
+      <div class="callout note">
+        <span class="tag up">扩容信号 RC</span>
+        <pre class="formula">RC = max(0,
+   TotalDemand / scaleUpThreshold
+   − TotalAnticipatedSupply)</pre>
+      </div>
+      <div class="callout note">
+        <span class="tag down">缩容信号 SC</span>
+        <pre class="formula">SC = max(0,
+   TotalSupply
+   − TotalDemand / scaleDownBoundary)</pre>
+      </div>
+    </div>
+    <table>
+      <tr><th>字段</th><th>含义</th><th>单位</th><th>值/来源</th><th>在公式中的作用</th></tr>
+      <tr><td><b><code>RC</code></b> (RequiredCapacity)</td><td>扩容缺口</td><td>token</td><td>计算结果</td><td><span class="pill up">&gt;0 → 扩容</span>，数值=还差多少 token</td></tr>
+      <tr><td><b><code>SC</code></b> (SpareCapacity)</td><td>缩容富余</td><td>token</td><td>计算结果</td><td><span class="pill down">&gt;0 → 允许缩容</span>，数值=富余多少 token</td></tr>
+      <tr><td><code>scaleUpThreshold</code></td><td>扩容水位</td><td>比例</td><td>默认 <b>0.85</b></td><td>需求÷它=要求达到的供给（留 15% headroom）</td></tr>
+      <tr><td><code>scaleDownBoundary</code></td><td>缩容水位</td><td>比例</td><td>默认 <b>0.70</b></td><td>需求÷它=缩容后不能超过的供给下限</td></tr>
+    </table>
+    <div class="callout note">
+      <span class="tag">为什么是"需求 /阈值"</span>
+      扩容：<code class="inline">TotalDemand / 0.85</code> = "要让利用率≤85% 所需总供给"，减去在途供给即缺口。<br>
+      缩容：<code class="inline">TotalDemand / 0.70</code> = "缩容后利用率不超 70% 的最低供给"，当前供给减去它才是可安全砍掉的富余。<br>
+      <strong>0.70 &lt; 0.85 形成滞回带</strong>：利用率在 70%~85% 间时 RC=SC=0，系统不动，避免抖动。
+    </div>
+
+    <h3>第 6 组 · 副本数换算字段（Optimizer）</h3>
+    <pre class="formula">k = max( floor( ΔUtil × RC / PerReplicaCapacity ),  min(1, n) )</pre>
+    <table>
+      <tr><th>符号</th><th>含义</th><th>单位</th><th>说明</th></tr>
+      <tr><td><code>k</code></td><td>本轮该变体增加的副本数</td><td>个</td><td>最终输出</td></tr>
+      <tr><td><code>RC</code></td><td>待补容量缺口</td><td>token</td><td>上面的扩容信号</td></tr>
+      <tr><td><code>PerReplicaCapacity</code></td><td>每副本容量</td><td>token</td><td>分母：一个副本能补多少 token</td></tr>
+      <tr><td><code>ΔUtil</code> (deltaUtil)</td><td>联合提交的利用率步长</td><td>比例</td><td>非 P/D 单角色 ≈1；P/D 取各角色瓶颈最小值，保证配对提交</td></tr>
+      <tr><td><code>n</code></td><td>本轮理论应加副本数</td><td>个</td><td><code>min(1,n)</code> 是保底：缺口&gt;0 时至少加 1</td></tr>
+      <tr><td>cost efficiency</td><td>成本效率</td><td>cost/token</td><td><code>Cost / PerReplicaCapacity</code>，扩容选最小者（最划算）</td></tr>
+    </table>
+    <div class="callout warn">
+      <span class="tag">扩容 vs 缩容的不对称</span>
+      扩容有 <code class="inline">min(1,n)</code> 保底（缺口不足一副本也补 1，宁可多）；缩容<strong>没有</strong>保底，富余不足整整一个副本时不缩（宁可留），从最贵变体开始砍。
+    </div>
+
+    <h3>一图看懂字段流转</h3>
+    <pre>[原始指标] KvCacheUsage, NumGpuBlocks×BlockSize, QueueLength, I, O, QueueSize/Bytes
+     │
+     ├─容量─→ k1 = TotalKvCap × 0.80 ┐
+     │        k2 = f(B, S, I, O)     ├→ effectiveCap = min(k1,k2) → PerReplicaCapacity = median(...)
+     │                ┘
+     ├─需求─→ TokensInUse + QueueLength×(I 或 I+O) + queueDemand → TotalDemand
+     │
+     └─供给─→ Σ ReplicaCount×PerReplicaCap        → TotalSupply
+              Σ (ReplicaCount+Pending)×PerReplicaCap → TotalAnticipatedSupply
+     │
+     ▼ [阈值后处理 0.85 / 0.70]
+   RC = max(0, TotalDemand/0.85 − TotalAnticipatedSupply)   ← 扩
+   SC = max(0, TotalSupply − TotalDemand/0.70)              ← 缩
+     │
+     ▼ [Optimizer]
+   k = max(floor(RC / PerReplicaCapacity), min(1,n))  → target = Current ± k
+     │
+     ▼
+   wva_desired_replicas → HPA/KEDA 改replicas</pre>
+  </section>
+
+  <!-- 8 -->
+  <section id="metrics-source">
+    <h2 class="sec"><span class="num">8</span>指标来源（在哪采集）</h2>
+    <p class="lead">WVA <strong>不直接 scrape pod</strong>，而是统一从 <b>Prometheus</b> 查询（<code class="inline">internal/prometheus/</code> 客户端 + <code class="inline">collector/source/prometheus</code>）。所有指标的<strong>原始暴露端点</strong>可归为三个来源。</p>
+
+    <div class="callout key">
+      <span class="tag">采集路径</span>
+      各组件把指标暴露在自己的 <code class="inline">/metrics</code> 端点 → Prometheus（通过 ServiceMonitor/PodMonitor）scrape 汇聚 → <b>WVA 用 PromQL 向 Prometheus 查询</b>，而非直接访问 pod。WVA 只暴露自己产出的指标供 HPA/KEDA 读取。
+    </div>
+
+    <h3>来源 A · 推理引擎 pod 的 /metrics（vLLM / SGLang）</h3>
+    <p>由每个模型服务 pod 自身暴露，指标名带 <code class="inline">vllm:</code> 或 <code class="inline">sglang:</code> 前缀，<strong>按 pod / instance 粒度</strong>。是容量与需求分析的主力数据。查询定义见 <code class="inline">collector/registration/saturation.go</code>。</p>
+    <table>
+      <tr><th>WVA 逻辑指标</th><th>vLLM 指标</th><th>SGLang 指标</th><th>用途</th></tr>
+   <tr><td>KvCacheUsage</td><td><code>vllm:kv_cache_usage_perc</code></td><td><code>sglang:token_usage</code></td><td>KV 占用率 → TokensInUse</td></tr>
+      <tr><td>QueueLength</td><td><code>vllm:num_requests_waiting</code></td><td><code>sglang:num_queue_reqs</code></td><td>本地队列需求</td></tr>
+      <tr><td>CacheConfigInfo</td><td><code>vllm:cache_config_info</code><br>(num_gpu_blocks, block_size)</td><td><code>sglang:max_total_num_tokens</code></td><td>KV 总容量 → k1</td></tr>
+      <tr><td>AvgOutputTokens (O)</td><td><code>vllm:request_generation_tokens_{sum,count}</code></td><td><code>sglang:generation_tokens_histogram_*</code></td><td>k2 推导 / 需求</td></tr>
+    <tr><td>AvgInputTokens (I)</td><td><code>vllm:request_prompt_tokens_{sum,count}</code></td><td><code>sglang:prompt_tokens_histogram_*</code></td><td>k2 推导 / 需求</td></tr>
+      <tr><td>PrefixCacheHitRate</td><td><code>vllm:prefix_cache_{hits,queries}</code></td><td><code>sglang:cached_tokens_total / prompt_tokens_total</code></td><td>队列需求折减</td></tr>
+   <tr><td>AvgTTFT / AvgITL</td><td><code>vllm:time_to_first_token_seconds_*</code><br><code>vllm:inter_token_latency_seconds_*</code></td><td>—</td><td>排队模型参数学习</td></tr>
+      <tr><td>GenerationTokenRate</td><td><code>rate(vllm:request_generation_tokens_sum[1m])</code></td><td>—</td><td>吞吐分析</td></tr>
+      <tr><td>ModelRequestCount</td><td><code>vllm:request_success_total</code></td><td>—</td><td>scale-to-zero 判定</td></tr>
+    </table>
+    <p class="muted">过滤 label：<code class="inline">namespace</code> + <code class="inline">model_name</code>；保留 <code class="inline">instance / pod / llm_d_ai_variant</code> 用于 pod→变体映射。多数用 <code class="inline">max_over_time(...[1m])</code> 取峰值。<br><b>例外</b>：<code class="inline">vllm:cache_config_info</code> 是 info 型指标、无 <code class="inline">model_name</code> label，故按 namespace 全量查询后由采集器按 instance 关联到本模型 pod。</p>
+
+    <h3>来源 B · llm-d 推理调度器 / 网关 EPP 的 metrics</h3>
+    <p>来自 llm-d 的 gateway-api-inference-extension（EPP，Endpoint Picker）组件，<strong>模型级、非 per-pod</strong>——因为这些请求还排在调度器的 flow-control 层、尚未路由到任何后端 pod。指标名带 <code class="inline">inference_extension_</code> 前缀。查询见 <code class="inline">saturation.go</code> 与 <code class="inline">throughput_analyzer.go</code>。</p>
+    <table>
+      <tr><th>WVA 逻辑指标</th><th>EPP 指标</th><th>用途</th></tr>
+      <tr><td>SchedulerQueueSize</td><td><code>inference_extension_flow_control_queue_size</code></td><td>调度器队列需求 / scale-from-zero 触发</td></tr>
+      <tr><td>SchedulerQueueBytes</td><td><code>inference_extension_flow_control_queue_bytes</code></td><td>调度器队列需求（按字节估 token）</td></tr>
+    <tr><td>ArrivalRate / DispatchRate</td><td><code>inference_extension_scheduler_attempts_total{status="success"}</code></td><td>请求到达率（排队模型 / 吞吐）</td></tr>
+    </table>
+ <div class="callout warn">
+      <span class="tag">上游限制 (#2309)</span>
+      这些 EPP 指标目前<strong>缺少 namespace label</strong>，用 <code class="inline">target_model_name</code>（回退 <code class="inline">model_name</code>）匹配。若同名模型存在于不同 namespace，会跨命名空间聚合，待上游补 namespace label 后修正。
+    </div>
+
+    <h3>来源 C · WVA 自身产出的指标（出口，非入口）</h3>
+    <p>WVA 把优化结果暴露在自己的 <code class="inline">/metrics</code> 端点，供外部 autoscaler 消费——这是<strong>下发通道</strong>而非采集来源。</p>
+    <table>
+      <tr><th>指标</th><th>含义</th><th>消费方</th></tr>
+      <tr><td><code>wva_desired_replicas</code></td><td>优化器算出的目标副本数</td><td>HPA / KEDA（作为 External Metric）</td></tr>
+   <tr><td><code>wva_saturation_utilization</code></td><td>利用率</td><td>可观测性 / 面板</td></tr>
+    <tr><td><code>wva_required_capacity</code> / <code>wva_spare_capacity</code></td><td>RC / SC 信号</td><td>可观测性 / GPU 限制器排序</td></tr>
+    </table>
+
+    <h3>数据流全景</h3>
+    <pre>[来源 A] vLLM/SGLang pod  ── /metrics (vllm: / sglang:) ──┐
+[来源 B] llm-d EPP 网关   ── /metrics (inference_extension_) ─┤
+        ▼
+  Prometheus  (ServiceMonitor/PodMonitor scrape)
+         │  PromQL 查询
+      ▼
+         WVA Collector → 引擎决策
+          │  emit
+       ▼
+[来源 C] wva_desired_replicas (WVA /metrics) → Prometheus → HPA/KEDA 改 replicas</pre>
+  </section>
+
+  <!-- 9 -->
+  <section id="demo">
+    <h2 class="sec"><span class="num">9</span>完整扩容 Demo（数值演算）</h2>
+
+    <div class="callout note">
+      <span class="tag">场景</span>
+      模型 <code class="inline">llama-3-8b</code>，单变体 <code class="inline">llama-a100</code>（非 P/D，role=both）；当前 replicas=2 均 ready；每副本 1×A100，cost=10；Min=1，Max=8；阈值 0.85/0.70；KvCacheThreshold=0.9；vLLM 主路径。流量突然上涨。
+    </div>
+
+    <div class="demo-card">
+      <h4>阶段 0 · Prometheus 原始指标</h4>
+  <table>
+   <tr><th>指标</th><th>pod-1</th><th>pod-2</th><th>来源</th></tr>
+        <tr><td>TotalKvCapacityTokens</td><td>100,000</td><td>100,000</td><td><code>vllm:cache_config_info</code></td></tr>
+        <tr><td>KvCacheUsage</td><td>0.95</td><td>0.92</td><td><code>vllm:kv_cache_usage_perc</code></td></tr>
+    <tr><td>TokensInUse</td><td>95,000</td><td>92,000</td><td>usage × capacity</td></tr>
+ <tr><td>QueueLength</td><td>8</td><td>6</td><td><code>vllm:num_requests_waiting</code></td></tr>
+        <tr><td>AvgInput / AvgOutput</td><td>500 / 300</td><td>500 / 300</td><td>rate 比值</td></tr>
+      </table>
+      <p class="muted">调度器队列：QueueSize=10，QueueBytes=20,000，PrefixCacheHitRate=0.2，BytesPerToken=4。</p>
+
+    <h4>阶段 1 · 容量与需求</h4>
+      <pre>k1 = 100,000 × 0.9 = 90,000    (两 pod 相同)
+k2 : QueueLen 8/6 &lt; 阈值16 → 非观测态 → 回退 k1 = 90,000
+effectiveCapacity = min(90,000, 90,000) = 90,000
+
+waitingQueueDemand (both, I+O=800):
+  pod-1: 8 × 800 = 6,400    pod-2: 6 × 800 = 4,800
+replicaDemand:
+  pod-1: 95,000 + 6,400 = 101,400   (&gt; 90,000 → IsSaturated)
+  pod-2: 92,000 + 4,800 =  96,800
+
+PerReplicaCapacity = median([90,000, 90,000]) = 90,000
+变体 TotalDemand = 101,400 + 96,800 = 198,200
+
+调度器队列需求:
+  tokensFromBytes = 20,000 / 4 = 5,000
+  tokensFromCount = 10 × 500  = 5,000
+  inputTokens  = max(5000,5000) × (1−0.2) = 4,000
+  outputTokens = 10 × 300 = 3,000
+  queueDemand  = 7,000</pre>
+
+<h4>模型级三总量</h4>
+      <pre>TotalSupply      = 2 × 90,000 = 180,000
+TotalDemand            = 198,200 + 7,000 = 205,200
+TotalAnticipatedSupply = (2+0) × 90,000 = 180,000
+Utilization      = 205,200 / 180,000 = 1.14  (114% 过载)</pre>
+
+      <h4>阶段 2 · 触发判定</h4>
+      <pre class="formula">RC = max(0, 205,200/0.85 − 180,000)
+   = max(0, 241,412 − 180,000) = <b>61,412</b>   → <span style="color:#ff7a59">扩容</span>
+SC = max(0, 180,000 − 205,200/0.70)
+   = max(0, 180,000 − 293,142) = 0             → 不缩</pre>
+
+      <h4>阶段 3 · 换算副本数</h4>
+      <pre>k = max(floor(61,412 / 90,000), min(1,n))
+  = max(floor(0.68), 1) = 1        ← 缺口不足一副本，保底 +1
+剩余 RC = 61,412 − 1×90,000 = −28,588 → clamp 0 → 循环结束
+target = 2 + 1 = <b>3</b>   →  Action = ScaleUp</pre>
+
+ <h4>阶段 4 · 下发</h4>
+      <pre>Status.DesiredOptimizedAlloc.NumReplicas = 3
+wva_desired_replicas{variant="llama-a100"} = 3
+  → HPA/KEDA 把 Deployment replicas 从 2 改为 3</pre>
+
+      <h4>下一 tick · 收敛（不抖动）</h4>
+      <pre>新供给 = 3 × 90,000 = 270,000
+RC = max(0, 205,200/0.85 − 270,000) = 0   → 不再扩
+SC = max(0, 270,000 − 205,200/0.70) = 0   → 也不缩
+落在滞回带内 → NoChange，稳定在 3 副本</pre>
+    </div>
+
+    <h3>一页纸公式总结</h3>
+    <table>
+      <tr><th>步骤</th><th>公式</th><th>Demo 结果</th></tr>
+      <tr><td>每副本容量</td><td>min(k1, k2)，k1 = KvCap × 0.9</td><td>90,000</td></tr>
+   <tr><td>每副本需求</td><td>TokensInUse + QueueLen×(I+O)</td><td>101,400 / 96,800</td></tr>
+      <tr><td>队列需求</td><td>max(bytes/4, size×I)×(1−hit) + size×O</td><td>7,000</td></tr>
+      <tr><td>总供给 / 总需求</td><td>Σ Cap / Σ demand+queue</td><td>180,000 / 205,200</td></tr>
+      <tr><td><b>扩容信号 RC</b></td><td>max(0, 需求/0.85 − 在途供给)</td><td><span class="pill up">61,412 → 扩</span></td></tr>
+   <tr><td><b>缩容信号 SC</b></td><td>max(0, 供给 − 需求/0.70)</td><td><span class="pill no">0 → 不缩</span></td></tr>
+      <tr><td><b>副本增量</b></td><td>floor(RC / PerReplicaCap)，扩容保底 +1</td><td>+1 → target=3</td></tr>
+      <tr><td>下发</td><td>wva_desired_replicas → HPA/KEDA</td><td>2 → 3</td></tr>
+    </table>
+  </section>
+
+  <!-- 10 -->
+  <section id="datasource">
+  <h2 class="sec"><span class="num">10</span>容量数据来源解析</h2>
+    <div class="callout key">
+      <span class="tag">结论</span>
+      容量值<strong>既不来自数据库，也不来自离线压测报告</strong>。它是运行时实时算出来的——主要来自 <b>实时 Prometheus 指标</b>，实时数据缺失时才回退到 <b>Deployment 启动参数的公式推导</b>。全程内存态，<strong>无 SQL、无落盘</strong>。
+    </div>
+
+    <h3>k1 · 来自实时指标</h3>
+    <pre>vLLM :  TotalKvCapacityTokens = num_gpu_blocks × block_size (从 vllm:cache_config_info 读)
+SGLang: TotalKvCapacityTokens = sglang:max_total_num_tokens  (直接暴露)</pre>
+    <p class="muted"><code class="inline">num_gpu_blocks</code> 是 vLLM 引擎启动时自己 profiling 出来的真实显存容量，通过 metrics 暴露。</p>
+
+    <h3>k2 · 四级优先级链（越靠前越"实测"）</h3>
+    <table>
+      <tr><th>优先级</th><th>来源</th><th>数据性质</th></tr>
+      <tr><td>P1 观测态</td><td>队列饱和时把当前 <code>TokensInUse</code> 当 k2</td><td>实时压力下的真实观测（相当于线上自动压测）</td></tr>
+   <tr><td>P2 历史</td><td>P1 观测值的内存滚动平均</td><td>近期实时观测平滑值</td></tr>
+<tr><td>P3 推导</td><td>Deployment 启动参数 + 实时工作负载</td><td>配置参数 × 实时流量画像</td></tr>
+      <tr><td>P4 回退</td><td>取 k1</td><td>纯内存约束兜底</td></tr>
+  </table>
+    <p>P3 推导公式（<code class="inline">estimateCapacityFromParams</code>）：</p>
+    <pre class="formula">N_steady = min(B × O / (I + O),  S)
+k2       = N_steady × (I + O/2)
+  B = EffectiveMaxBatchedTokens  (--max-num-batched-tokens，默认 V1=8192 / V0=2048)
+  S = MaxNumSeqs         (--max-num-seqs，默认 256)
+  I, O = 平均输入/输出 token (实时 Prometheus 指标)</pre>
+
+    <h3>CapacityKnowledgeStore · 内存缓存（非数据库）</h3>
+    <p><code class="inline">CapacityRecord.LearnedFrom</code> 标明每条记录血统：</p>
+ <table>
+      <tr><th>LearnedFrom</th><th>来源</th><th>用途</th></tr>
+      <tr><td><code>"live"</code></td><td>运行中 pod 的实时指标</td><td>最权威，优先使用</td></tr>
+      <tr><td><code>"deployment"</code></td><td>Deployment CLI args 解析</td><td>0 副本 / 冷启动兜底估算</td></tr>
+ <tr><td><code>"annotation"</code></td><td>资源注解显式覆盖</td><td>人工指定值</td></tr>
+    </table>
+    <p class="muted">该 Store 是 thread-safe in-memory cache，进程重启即失效，靠 EvictStale（24h）清理，<strong>不持久化</strong>。</p>
+
+    <h3>数据来源优先级链</h3>
+    <pre>实时指标 (live: cache_config_info + 观测峰值)
+   ↓ 缺失
+Deployment CLI 参数推导 (deployment: max-num-batched-tokens 等)
+   ↓ 缺失
+兼容变体借用 (FindCompatible) / k1 内存上界兜底</pre>
+
+    <table>
+      <tr><th>候选来源</th><th>是否命中</th><th>说明</th></tr>
+      <tr><td>压测数据</td><td>半命中（在线，非离线）</td><td>无离线压测文件；k2 的 P1/P2 相当于用线上真实峰值当压测结果</td></tr>
+      <tr><td>计算 / SQL 数据</td><td>不命中</td><td>代码里无数据库、无 SQL、无持久化；Store 是纯内存 cache</td></tr>
+      <tr><td>初始配置数据</td><td>部分命中</td><td>仅作冷启动兜底：解析 Deployment 的 CLI flag 推导</td></tr>
+ </table>
+  </section>
+
+  <!-- 11 -->
+  <section id="risks">
+    <h2 class="sec"><span class="num">11</span>设计要点与潜在风险</h2>
+    <div class="callout warn"><span class="tag">release-0.9 · 投票与容量来源</span><code>Enabled</code> 决定投票，<code>Live</code> 标记近期容量信号。saturation 始终提供完整变体身份，但禁用后不能否决缩容；日志仍出现不代表投票。bindingAnchor 优先绑定可用且投票的 saturation，否则绑定唯一可用的非 saturation analyzer；无有效来源则保持副本。</div>
+    <div class="callout note"><span class="tag">release-0.9 · T-sfz</span>throughput 可复用此前测得的零副本变体容量，reason 为 <code>T-sfz</code>。没有历史容量时 PRC 不会被伪造；真正冷启动仍依赖独立 scale-from-zero 引擎。历史状态不跨进程保留。</div>
+    <div class="callout warn">
+      <span class="tag">1 · 需求侧系统性偏向扩容</span>
+      队列请求按完整 <code class="inline">I+O</code> 峰值计费；<code class="inline">kv_cache_usage</code> 与 <code class="inline">num_requests_waiting</code> 都取 1 分钟 <code class="inline">max_over_time</code>（两峰值不必同时发生，求和可能高估瞬时需求）。有意为之——宁可多一副本，也不愿欠配触发抢占重算。生产中表现为<strong>偏激进扩容</strong>。
+    </div>
+    <div class="callout warn">
+      <span class="tag">2 · DP 换算时序偏差</span>
+  扩容瞬间新实例先上报 metrics 而 scale-target status 尚未 ready，<code class="inline">len(replicas)/readyCount</code> 比值被抬高，导致 pending 折算过量、RC 被低估（代码有 TODO 标注）。
+    </div>
+    <div class="callout warn">
+      <span class="tag">3 · fallback 单位不一致</span>
+      模型服务不吐 <code class="inline">cache_config_info</code> 时，EffectiveCapacity 是 per-step token 预算，而队列 demand 是绝对 KV token，深队列可能误报饱和。已单独 tracked。
+    </div>
+    <div class="callout note">
+ <span class="tag">4 · leader-only + fail-fast</span>
+      多引擎循环靠 controller-runtime leader election 保证单点决策；Prometheus 不可达时直接退出。
+    </div>
+  </section>
+
+  <!-- 12 -->
+<section id="files">
+    <h2 class="sec"><span class="num">12</span>关键文件速查</h2>
+    <table class="filemap">
+      <tr><th>环节</th><th>文件 : 函数</th></tr>
+      <tr><td>主循环</td><td><code>saturation/engine.go</code> : optimize / optimizeV2</td></tr>
+      <tr><td><b>触发判定公式</b></td><td><code>saturation/engine_v2.go</code> : applyUniversalThreshold</td></tr>
+    <tr><td>阈值默认值</td><td><code>internal/config/saturation_scaling.go</code>（0.85 / 0.70）</td></tr>
+  <tr><td>容量模型 k1/k2</td><td><code>analyzers/saturation_v2/analyzer.go</code> : computeReplicaCapacity / computeK2</td></tr>
+      <tr><td>需求估算</td><td>同上 : waitingQueueDemand / estimateSchedulerQueueDemand</td></tr>
+      <tr><td>容量存储</td><td><code>analyzers/saturation_v2/capacity_store.go</code> / deployment_parser.go</td></tr>
+  <tr><td>扩缩容分支</td><td><code>pipeline/cost_aware_optimizer.go</code> : Optimize</td></tr>
+  <tr><td>副本换算</td><td><code>pipeline/analyzer_helpers.go</code> : bindingAnchor / votingResults / allocateForModelPaired</td></tr>
+  <tr><td>指标采集</td><td><code>collector/replica_metrics.go</code></td></tr>
+      <tr><td>PromQL 查询定义</td><td><code>collector/registration/</code>：saturation.go (vLLM/SGLang+EPP) / queueing_model.go / throughput_analyzer.go / scale_to_zero.go</td></tr>
+      <tr><td>决策落地 + emit</td><td><code>saturation/engine.go</code> : applySaturationDecisions</td></tr>
+      <tr><td>间接下发（指标）</td><td><code>actuator/actuator.go</code> : EmitMetrics → metrics.go : wva_desired_replicas</td></tr>
+      <tr><td>直接下发（0→1）</td><td><code>actuator/direct_actuator.go</code> + <code>engines/scalefromzero/engine.go</code></td></tr>
+      <tr><td>内存态类型</td><td><code>variant/types.go</code>（合成的 VariantAutoscaling）</td></tr>
+    </table>
+  </section>
+
+  <footer>
+    WVA 扩缩容实现逻辑详解 &nbsp;·&nbsp; 基于 release-0.9 @ d5d5864 源码核对 &nbsp;·&nbsp; llm-d-workload-variant-autoscaler
+  </footer>
+
+</div>
+</body>
+</html>

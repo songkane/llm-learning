@@ -31,6 +31,9 @@ REPOS=(
   "kubernetes|https://github.com/kubernetes/kubernetes.git|v1.36.3"
   "volcano|https://github.com/volcano-sh/volcano.git|v1.15.1"
   "kueue|https://github.com/kubernetes-sigs/kueue.git|v0.19.1"
+  # 文档按 release-0.9 分支分析，2026-09-07 核对 HEAD 为 d5d5864。
+  # v0.9.0 tag 指向 aadaa59，分支多 3 个提交；不要将两者视为相同基线。
+  "llm-d-autoscaling|https://github.com/llm-d/llm-d-autoscaling.git|release-0.9"
 )
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
