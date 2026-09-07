@@ -10,7 +10,7 @@
 |------|------|------|
 | 推理引擎 | [`inference-engine/`](inference-engine/) | 大模型推理引擎的架构与源码剖析（vLLM、SGLang） |
 | KV Cache 基础设施 | [`kvcache/`](kvcache/) | KV Cache 的跨实例共享与跨节点传输（Mooncake） |
-| 调度与编排 | [`scheduling/`](scheduling/) | 训练/推理作业的资源调度与编排（kube-scheduler、Volcano、Kueue） |
+| 调度与编排 | [`scheduling/`](scheduling/) | 训练/推理作业的资源调度、编排与自动扩缩容（kube-scheduler、Volcano、Kueue、llm-d WVA） |
 
 > 更多分类（训练、MaaS 平台、Agent、RAG 等）将持续补充。
 
@@ -38,7 +38,7 @@
 
 ### 调度与编排
 
-聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」。
+聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」，以及「推理服务到底该开几个副本」。
 
 - [**kube-scheduler 源码学习**](scheduling/kube-scheduler/) —— K8s 原生调度器，一切的地基：调度框架 15 个扩展点、三队列与 QueueingHint、增量快照与 assume、过滤采样与打分归一化、抢占六轮打分、DRA，以及 **v1.36 新引入的原生 gang 调度与拓扑感知 Placement**（Alpha）。另附两篇扩展实战：**自建插件**（Framework Plugin，每个扩展点一个可编译 demo）与**免编译扩展**（Extender / SchedulingGates / Webhook / DRA，用官方镜像零编译）。
 
@@ -46,7 +46,11 @@
 
 - [**Kueue 源码学习**](scheduling/kueue/) —— 作业级准入控制器：ClusterQueue/Cohort 配额借用、ResourceFlavor 异构机型、TAS 拓扑感知、MultiKueue 多集群。
 
-> 一句话区分：**Kueue 决定「作业什么时候可以开始」，kube-scheduler 与 Volcano 决定「Pod 落到哪个节点」**（后两者按 `schedulerName` 分流、互斥）。建议先读 kube-scheduler 的 00~01 建立地基，再看另两个补了什么缺口。详见 [scheduling/README](scheduling/README.md)。
+> 一句话区分上面三者：**Kueue 决定「作业什么时候可以开始」，kube-scheduler 与 Volcano 决定「Pod 落到哪个节点」**（后两者按 `schedulerName` 分流、互斥）。建议先读 kube-scheduler 的 00~01 建立地基，再看另两个补了什么缺口。详见 [scheduling/README](scheduling/README.md)。
+
+另有一套**自动扩缩容**的笔记，问题域不同（不管 Pod 放哪，只管该有几个 Pod），可独立阅读：
+
+- [**llm-d WVA 源码学习**](scheduling/llm-d-autoscaling/) —— llm-d 的 Workload Variant Autoscaler，工作在 scale 层，产出 `wva_desired_replicas` 指标供 HPA/KEDA 消费。带 LLM 语义的容量模型：**token 供需双阈值**（`RC = max(0, demand/0.85 − anticipated)` / `SC = max(0, supply − demand/0.70)`，0.70~0.85 是结构性死区）、**异构机型成本优化**（同模型多变体按 `cost/每副本容量` 择优）、**P/D 分离联合扩容**（Δ_util 匹配，避免单侧超扩）、**多 analyzer 投票与容量来源选择**（saturation / throughput、`T-sfz` 历史容量复用；QM 排队论实现当前禁用）、**缩容到零与 100ms 冷启动唤醒**。附一份[计算逻辑可视化速查（HTML）](scheduling/llm-d-autoscaling/wva-autoscaling-logic.html)。
 
 ## 本地源码对照（`sources/`）
 
@@ -66,8 +70,13 @@
 | Kubernetes（kube-scheduler） | `sources/kubernetes` | `v1.36.3` | 137129 | 1.6G |
 | Volcano | `sources/volcano` | `v1.15.1` | 6620 | 152M |
 | Kueue | `sources/kueue` | `v0.19.1` | 6987 | 267M |
+| llm-d WVA | `sources/llm-d-autoscaling` | `release-0.9 @ d5d5864` | 1840 | 22M |
 
 合计约 2.9G。
+
+> WVA 使用 `release-0.9`（核对提交 `d5d5864`），与 `v0.9.0` tag 不同；详见 [版本对照](scheduling/llm-d-autoscaling/README.md#版本对照与复现)。
+>
+> `llm-d-autoscaling` 是仓库改名后的新名字（原 `llm-d-workload-variant-autoscaler`），`go.mod` 的 module 路径仍是老名字。
 
 **脚本只管「有没有」，不管「是哪个版本」**：已存在的仓库一律跳过，不做 `fetch`/`checkout`/`reset`；
 缺失的用标准 `git clone` 拉全（完整历史 + 全部 tag + 全部远端分支），并切到上表基线作为起点。
