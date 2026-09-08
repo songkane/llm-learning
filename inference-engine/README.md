@@ -71,3 +71,5 @@ cd sglang && git checkout v0.5.16
 两套笔记的 PD 分离篇（vLLM 05 / SGLang 05）都停在「KV 通过 RDMA 传给 Decode 实例」；SGLang 的 RadixCache 也只活在**单实例 GPU 显存**里。这两个缺口由 [`kvcache/`](../kvcache/) 分类补上：
 
 - [**Mooncake 源码学习**](../kvcache/mooncake/) —— KV 怎么跨实例搬运（Transfer Engine）、怎么跨实例与跨重启共享（Mooncake Store）。沿用同一组 A/B 请求示例，可直接与本目录笔记对照。
+
+再往外一层是 [`serving/`](../serving/)：llm-d / Dynamo 决定请求发给哪个副本、开几个副本。引擎笔记讲「一个副本内部怎么算」，服务栈讲「一堆副本怎么变成一个服务」。

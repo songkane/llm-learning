@@ -1,7 +1,7 @@
 # 06 · P/D 分离与 Sidecar
 
 > **源码基线**：[`main @ 90a28bc`](https://github.com/llm-d/llm-d-router/tree/90a28bc66f1d96f84f8f18f11dcd6ed15f34e830)
-> `pkg/sidecar`（6870 行）**就是原 `llm-d-routing-sidecar` 仓库**的代码，那个仓库已归档。`pkg/coordinator`（4982 行）是取代它的实验性方案。
+> 本篇的代码在 `pkg/sidecar`（6870 行，二进制 `pd-sidecar`，跑在 decode pod 内）与 `pkg/coordinator`（4982 行，实验性的集中编排方案，见 §7）。
 > 本篇回答 [00 篇](00-总览与架构.md#2-统一示例贯穿-0007-篇) 的第 6 个问题：**开了 P/D 分离后，请求 A 怎么先经过 P1 再回到 D3？**
 
 ## 0. 一句话定位
@@ -31,7 +31,7 @@ sequenceDiagram
     SC-->>EV: token 流
 ```
 
-**为什么 P/D 要分离**：prefill 是计算密集（compute-bound，一次算完整个 prompt），decode 是内存带宽密集（memory-bound，每次算一个 token）。放在同一张卡上，prefill 会打断正在 decode 的请求造成 ITL 抖动。分开跑，各自用最适合的硬件与批处理策略。这个动机与 [vLLM 的 P/D 分离](../../inference-engine/vllm/05-多机推理与PD分离.md) 和 [SGLang 的 PD 部署](../../inference-engine/sglang/05-部署场景-单机-多机-PD分离.md) 是一致的——**llm-d 补的是「谁来编排这两次调用」这一环。**
+**为什么 P/D 要分离**：prefill 是计算密集（compute-bound，一次算完整个 prompt），decode 是内存带宽密集（memory-bound，每次算一个 token）。放在同一张卡上，prefill 会打断正在 decode 的请求造成 ITL 抖动。分开跑，各自用最适合的硬件与批处理策略。这个动机与 [vLLM 的 P/D 分离](../../../inference-engine/vllm/05-多机推理与PD分离.md) 和 [SGLang 的 PD 部署](../../../inference-engine/sglang/05-部署场景-单机-多机-PD分离.md) 是一致的——**llm-d 补的是「谁来编排这两次调用」这一环。**
 
 ## 1. Sidecar 的形态
 
@@ -204,7 +204,7 @@ POST /inference/v1/generate    ┘
 
 ## 3. NIXLv2：默认的 KV 传输路径
 
-> 注意：仓库里**没有** `connector_nixl.go`（旧名）。NIXL 的实现文件是 **`connector_nixlv2.go`**，CLI 值是 `nixlv2`。
+> NIXL 的实现文件是 **`pkg/sidecar/proxy/connector_nixlv2.go`**，`--connector` 的取值是 `nixlv2`。
 
 ### 3.1 Prefill 请求的改写
 
@@ -289,7 +289,7 @@ WRITE 的收益是少一个 RTT（不用等 decode 来拉），代价是 prefill
 
 ### 4.1 Mooncake：bootstrap 查 engine ID
 
-这一节可以和 [Mooncake TransferEngine 笔记](../../kvcache/mooncake/01-TransferEngine传输引擎.md) 交叉阅读。
+这一节可以和 [Mooncake TransferEngine 笔记](../../../kvcache/mooncake/01-TransferEngine传输引擎.md) 交叉阅读。
 
 ```go
 // pkg/sidecar/proxy/connector_mooncake.go:62-137（节选）
@@ -495,7 +495,7 @@ Wide-EP（跨节点专家并行）靠 MoRI-IO 的 `--moriio-remote-hosts`、`--m
 
 ## 7. Coordinator：sidecar 的替代方案
 
-`pkg/coordinator`（4982 行）是个**实验性的架构重构**。
+`pkg/coordinator`（4982 行）是一个**实验性的独立编排服务**：把 sidecar 在 decode pod 内做的两阶段调用，搬到集群里一个独立 Deployment 上做。
 
 ### 7.1 架构差异
 

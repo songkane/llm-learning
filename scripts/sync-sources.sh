@@ -39,6 +39,9 @@ REPOS=(
   # generator/sidecar）尚无 pkg/kvcache 与 pkg/coordinator，不能作为本文基线。
   # release-0.10（71f4f09）已含二者，但比 main 少 179 个提交、各有分叉。
   "llm-d-router|https://github.com/llm-d/llm-d-router.git|main"
+  # NVIDIA Dynamo：单仓服务栈（Router / Planner / KVBM）。文档按 main 分析，
+  # 2026-09-08 核对 HEAD 为 946accea5e。
+  "dynamo|https://github.com/ai-dynamo/dynamo.git|main"
 )
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

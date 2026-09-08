@@ -72,10 +72,16 @@ inference-engine/    ← 推理引擎：请求怎么从字符串走到 GPU（算
        ▼
 kvcache/             ← 本分类：KV 怎么搬、怎么存（存 + 搬）
        │
+       │  这些副本如何被路由、扩缩、编排
+       ▼
+serving/             ← 推理服务栈：llm-d、Dynamo（含 Dynamo KVBM）
+       │
        │  这些实例与存储节点跑在哪
        ▼
 scheduling/          ← 调度编排：一堆 GPU 怎么被公平高效分配（调）
 ```
+
+Dynamo 的 **KVBM** 是服务栈内部的 KV 块管理（GPU→CPU→SSD 卸载），笔记落在 [`serving/dynamo/`](../serving/dynamo/)，与 Mooncake 对照着读：Mooncake 是独立的集群 KV 池，KVBM 是 Dynamo worker 侧的分层缓存。二者是叠加关系。
 
 ## 阅读前提
 

@@ -1,6 +1,8 @@
 # 调度与编排（Scheduling & Orchestration）
 
-大模型训练 / 推理的**资源调度与作业编排**学习资料。聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」这一核心问题。
+大模型训练 / 推理的**资源调度与作业编排**学习资料。聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」——也就是 **Pod 落到哪、作业何时开始**。
+
+「这个推理请求发给哪个副本」不在本分类落盘，正文在 [`serving/`](../serving/)（llm-d Router、Dynamo Router）；这里只留索引。
 
 ## 目录
 
@@ -14,27 +16,27 @@
 
 三者在同一个问题域（**资源怎么分给作业**）内互相可比，下面的分工图与能力矩阵只针对它们。
 
-### 推理请求路由（llm-d，不做 Pod 落位）
+### 推理请求路由（问题域索引，正文在 serving/）
 
-| 项目 | 目录 | 源码基线 | 定位 | 说明 |
-|------|------|---------|------|------|
-| llm-d Router | [`llm-d/`](llm-d/) | `main @ 90a28bc` | **推理请求路由器（request 层）** | 懂 LLM 成本结构的 L7 路由：插件化的过滤/打分/选择框架、KV Cache 前缀亲和路由、多租户流控准入、P/D 分离编排。以 Envoy ext-proc 形式给出每个请求的目标 pod |
+请求路由**不做 Pod 落位、不做作业准入**，与上面三个调度器不在同一个问题域。正文按项目收在 [`serving/`](../serving/)：
 
-它**不做 Pod 落位、不做作业准入**，与上面三个调度器不在同一个问题域，可以完全独立阅读。
+| 项目 | 目录 | 源码基线 | 定位 |
+|------|------|---------|------|
+| llm-d Router | [`serving/llm-d/router/`](../serving/llm-d/router/) | `main @ 90a28bc` | 懂 LLM 成本结构的 L7 路由（Envoy ext-proc / EPP） |
+| NVIDIA Dynamo Router | [`serving/dynamo/`](../serving/dynamo/02-核心代码分析-KV感知路由.md) | `main @ 946acce` | 单仓服务栈里的 KV-aware 路由：打分各项单位统一为 block 数、overlap 从 prefill 工作量里**减掉**；与 llm-d Router 的加权求和对比见 [07 篇 §2](../serving/dynamo/07-横向对比-与llm-d和Mooncake.md#2-打分减法-vs-加权求和) |
 
-> **副本数该是多少**不在本分类里，那是弹性扩缩容的问题域，见 [`autoscaling/`](../autoscaling/)（llm-d WVA）。三者的分工：**WVA 决定「该有几个副本」，Router 决定「这个请求发给哪个副本」，kube-scheduler / Volcano 决定「副本落到哪个节点」。**
+> **副本数该是多少**见 [`autoscaling/`](../autoscaling/) 索引（正文同样在 `serving/`）。三者的分工：**Scaler 决定「该有几个副本」，Router 决定「这个请求发给哪个副本」，kube-scheduler / Volcano 决定「副本落到哪个节点」。**
 
 ```mermaid
 flowchart LR
-    R["推理请求"] --> E["Router / EPP<br/>选哪个 pod（request 层）"]
+    R["推理请求"] --> E["Router<br/>serving/"]
     E --> P["model server pods"]
-    P -.指标.-> W["WVA（autoscaling/）<br/>该有几个副本（scale 层）"]
-    W -->|wva_desired_replicas| H["HPA / KEDA"]
-    H -->|spec.replicas| P
+    P -.指标.-> W["Scaler / Planner<br/>serving/"]
+    W -->|replicas| P
     P -.->|Pod 落位| S["kube-scheduler / Volcano"]
 ```
 
-> 调度器系列固定到表中 release tag；Router 按 **`main @ 90a28bc`** 分析（`v0.9.0` tag 缺 `pkg/kvcache` 与 `pkg/coordinator`，不可用作基线）。源码片段包含省略和教学注释，请按各系列 README 的基线检出后对照对应函数。
+> 调度器系列固定到表中 release tag。源码片段包含省略和教学注释，请按各系列 README 的基线检出后对照对应函数。
 
 ## 建议阅读顺序
 
@@ -48,7 +50,7 @@ Volcano 00  +  Kueue 00   ← 各读一遍总览，理解它们分别补了什�
 
 **为什么先读 kube-scheduler**：Volcano 直接复用了它的插件实现（`predicates`/`nodeorder` 插件 import 了 `k8s.io/kubernetes/pkg/scheduler/framework/plugins`），Kueue 则把 Pod 交还给它调度。不了解 `Filter`/`Score`/`Permit`/`PreEnqueue` 这套框架，读另外两个会缺一层地基。
 
-**Router 独立成篇**，与上面的顺序无关。想连着看扩缩容，读完 Router 的 Data Layer（03 篇）再去 [`autoscaling/`](../autoscaling/) 读 WVA 会更顺 —— WVA 的容量模型建立在对 KV token 供需的理解上。
+**请求路由独立阅读**，与上面的顺序无关。入口：[llm-d Router](../serving/llm-d/router/)；想连着看扩缩容，读完 Data Layer（03 篇）再去 [WVA](../serving/llm-d/autoscaling/)。同层对照见 [NVIDIA Dynamo](../serving/dynamo/)。
 
 ## 三者的分工
 
@@ -137,21 +139,7 @@ flowchart LR
 | [04](kueue/04-面向大模型训练与推理的能力地图.md) | 大模型能力地图 | 训练/推理/混部，与 Volcano 的三种组合形态 |
 | [05](kueue/05-实战Demo.md) | 实战 Demo | 配额 → JobSet+TAS 训练 → LWS 推理 → 借用回收 → 部分准入 |
 
-## llm-d Router 学习路线
-
-统一示例：P/D 分离部署（prefill `P1/P2` + decode `D1/D2/D3`），请求 A 与 B 共享一段 2000 token 的系统提示前缀 —— 追问「A 走完之后 B 该去哪」。
-
-| 篇 | 主题 | 核心问题 |
-|----|------|---------|
-| [00](llm-d/00-总览与架构.md) | 总览与架构 | Router 在 llm-d 里的位置、**术语变迁与项目边界**（仓库刚改名、KV Indexer 与 sidecar 刚合并进来）、代码地图、四条设计哲学、部署模式对照 |
-| [01](llm-d/01-请求的一生-主控制流.md) | **请求的一生** | 从 Envoy ext-proc 到选出 pod 的 14 步；**429 与 503 的分界线**（池子忙 vs 池子空）；profile 的迭代执行；三层状态传递；反直觉行为清单 |
-| [02](llm-d/02-核心代码分析-调度框架与插件体系.md) | **调度框架与插件体系** | 8 类扩展点、YAML 到运行时实例的两阶段实例化与依赖 DAG、打分机制（`[0,1]`、加权求和**不归一化**）、**全部内置插件清单**、默认注入与自动补全、feature gates、写自定义插件 |
-| [03](llm-d/03-核心代码分析-DataLayer与指标采集.md) | Data Layer 与指标采集 | 每 endpoint 一个 goroutine、每 50ms 抓一次 `/metrics`；按 `engine-type` label 适配 vLLM/SGLang 的指标名差异；`atomic.Pointer` 快照；**指标过期对不同消费者的不同后果** |
-| [04](llm-d/04-核心代码分析-KVCache索引与前缀缓存路由.md) | **KV 索引与前缀缓存路由** | 近似 vs 精确两条路线；ZMQ 事件摄取与按 pod 分片保序；`kvblock.Index` 结构；EPP 的 block key 为何不必与 vLLM 内部 hash 一致；**64 token 硬下限与静默退化的坑**；replay 恢复 |
-| [05](llm-d/05-核心代码分析-FlowControl流控与准入.md) | Flow Control 流控与准入 | **默认关闭**；单 Processor goroutine 的 actor 模型；`EnqueueAndWait`；内部错误到 429/503 的精确映射；`FlowKey` 与 priority band；**`utilization-detector` 的 fail-closed 行为**；驱逐机制 |
-| [06](llm-d/06-核心代码分析-PD分离与Sidecar.md) | **P/D 分离与 Sidecar** | sidecar 跑在 decode pod 里（不是 prefill）；四路分支；NIXLv2 默认协议下 prefill 请求如何改写与 `kv_transfer_params` 如何协调；**6 种 KV connector 对照**；E/P/D 多模态扇出；sidecar vs Coordinator |
-| [07](llm-d/07-部署配方与排障.md) | **部署配方与排障** | 三个官方配方逐行讲；调优决策表；**完整 sizing 数据**（EPP 空闲 CPU 随 pod 数增长）；HA 三模式与 Active-Active 的状态分区；**20 条静默失效模式总表**；排障决策树；上线检查清单 |
-
 ---
 
 > 各系列内部：00~01 建立框架直觉；中间几篇是源码细节，可按需查阅；最后一篇面向落地。
+> 请求路由与 LLM 语义扩缩容的正文：[serving/](../serving/)。

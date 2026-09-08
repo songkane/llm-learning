@@ -560,7 +560,7 @@ Data Layer 采到的是**引擎侧的**队列深度，最多滞后 50ms + scrape
 
 所以 `llm_d_epp_ready_endpoints` < 实际 pod 数就意味着有 pod 的指标采不上来。**这是 05 篇 Flow Control 全面停摆的前兆**——因为 `utilization-detector` 对 stale endpoint 按「完全饱和」计。
 
-WVA 侧的对照：WVA 消费的正是 §7.2 这些池级指标，它自己的 analyzer 也有一套 staleness 判断，见 [WVA 02 篇](../../autoscaling/llm-d-autoscaling/02-核心代码分析-指标采集与Analyzer.md)。**两层 staleness 阈值需要一起看**：EPP 认为 2s 过期，WVA 的窗口通常是分钟级，中间这段时间 WVA 可能在用 EPP 已经不信的数据。
+WVA 侧的对照：WVA 消费的正是 §7.2 这些池级指标，它自己的 analyzer 也有一套 staleness 判断，见 [WVA 02 篇](../autoscaling/02-核心代码分析-指标采集与Analyzer.md)。**两层 staleness 阈值需要一起看**：EPP 认为 2s 过期，WVA 的窗口通常是分钟级，中间这段时间 WVA 可能在用 EPP 已经不信的数据。
 
 ### 7.4 调度与插件
 

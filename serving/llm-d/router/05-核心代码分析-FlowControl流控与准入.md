@@ -704,7 +704,7 @@ func IsSheddable(priority int) bool {
 | `DefaultRequestTTL`（60s） | 池里**有** endpoint 时（真正的饱和排队） |
 | `NoEndpointRequestTTL` | 池里**没有** endpoint 时（scale-from-zero 的等候室） |
 
-分开的原因：scale-from-zero 场景下，请求要等 WVA/HPA 扩出 pod 再等 pod 就绪，可能需要几十秒到几分钟——比「后端忙」的合理等待时间长得多。这里和 [WVA 的 scale-from-zero](../../autoscaling/llm-d-autoscaling/03-核心代码分析-Optimizer与Limiter.md) 是配套的：**Flow Control 提供等候室，WVA 负责把 pod 拉起来**（WVA 直接改 replicas 的那个唯一例外场景就是它）。
+分开的原因：scale-from-zero 场景下，请求要等 WVA/HPA 扩出 pod 再等 pod 就绪，可能需要几十秒到几分钟——比「后端忙」的合理等待时间长得多。这里和 [WVA 的 scale-from-zero](../autoscaling/03-核心代码分析-Optimizer与Limiter.md) 是配套的：**Flow Control 提供等候室，WVA 负责把 pod 拉起来**（WVA 直接改 replicas 的那个唯一例外场景就是它）。
 
 ### 9.2 Regime 切换会重置计费起点
 

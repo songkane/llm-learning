@@ -1,7 +1,7 @@
 # 04 · KV-Cache 索引与前缀缓存路由
 
 > **源码基线**：[`main @ 90a28bc`](https://github.com/llm-d/llm-d-router/tree/90a28bc66f1d96f84f8f18f11dcd6ed15f34e830)
-> `pkg/kvcache`（3621 行）与 `pkg/kvevents`（2642 行）**是最近才从 `llm-d/llm-d-kv-cache` 仓库迁进来的**（上游 PR #1886）。`v0.9.0` tag 里还没有它们——这是本系列钉在 `main` 的直接原因。
+> 本篇的代码在 `pkg/kvcache`（3621 行，索引与打分）与 `pkg/kvevents`（2642 行，ZMQ 事件摄取）两个包里，都随 EPP 同进程运行，无需单独部署。
 > 本篇回答 [00 篇](00-总览与架构.md#2-统一示例贯穿-0007-篇) 的第 4 个问题：**请求 B 进来时，EPP 怎么知道 D3 上已经有那 12 个 token 的 KV？**
 
 ## 0. 两条路线，一个目标
@@ -141,7 +141,7 @@ type AllBlocksClearedEvent struct {
 }
 ```
 
-`DeviceTier` 是分层的关键：同一个 block 可能同时在 GPU 和 CPU 上，不同 tier 的价值不同（§5.2 打分会用到）。这对应 vLLM 的多级 offloading，也是 [Mooncake 的分层存储](../../kvcache/mooncake/03-分层存储与持久化.md) 在网关侧的可见性。
+`DeviceTier` 是分层的关键：同一个 block 可能同时在 GPU 和 CPU 上，不同 tier 的价值不同（§5.2 打分会用到）。这对应 vLLM 的多级 offloading，也是 [Mooncake 的分层存储](../../../kvcache/mooncake/03-分层存储与持久化.md) 在网关侧的可见性。
 
 `KVCacheSpecKind` 用来跳过不可前缀索引的 attention 类型（§8.3）。
 
@@ -501,7 +501,7 @@ func (db *chunkedTokenDatabase) prefixHashes(
 }
 ```
 
-每个 block 的 hash 包含**上一个 block 的 hash**。这个链式结构保证了「hash 相同 ⇒ 从头到这里的整个前缀相同」，正是最长前缀匹配需要的性质。和 vLLM / SGLang 内部的前缀树是同一个思想（见 [SGLang RadixCache](../../inference-engine/sglang/06-RadixCache深度剖析.md)），只是这里用链式 hash 而不是树。
+每个 block 的 hash 包含**上一个 block 的 hash**。这个链式结构保证了「hash 相同 ⇒ 从头到这里的整个前缀相同」，正是最长前缀匹配需要的性质。和 vLLM / SGLang 内部的前缀树是同一个思想（见 [SGLang RadixCache](../../../inference-engine/sglang/06-RadixCache深度剖析.md)），只是这里用链式 hash 而不是树。
 
 写路径解析 parent 的那一步：
 
@@ -593,7 +593,7 @@ type PodMatch struct {
 }
 ```
 
-**tier 加权的意义**：同一个 block 在 GPU 上和在 CPU offload 里价值不同。GPU 上是零成本复用，CPU 上还要搬一次（这就是 [Mooncake TransferEngine](../../kvcache/mooncake/01-TransferEngine传输引擎.md) 干的事）。所以 CPU tier 的 block 权重 < 1.0，`WeightedScore` 因此可能小于 `MatchedBlocks`。
+**tier 加权的意义**：同一个 block 在 GPU 上和在 CPU offload 里价值不同。GPU 上是零成本复用，CPU 上还要搬一次（这就是 [Mooncake TransferEngine](../../../kvcache/mooncake/01-TransferEngine传输引擎.md) 干的事）。所以 CPU tier 的 block 权重 < 1.0，`WeightedScore` 因此可能小于 `MatchedBlocks`。
 
 ### 5.3 Producer 与 Scorer 的绑定
 
