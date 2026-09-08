@@ -190,11 +190,15 @@ spec:
             - --model=Qwen/Qwen3-8B
             - --port=8000                        # ← 直接占用池子的 targetPort
             - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_both"}
-            - --kv-events-config={"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558"}
+            # topic 必须是 kv@<pod>@<model> 三段式，否则 EPP 一条事件也收不到
+            - --kv-events-config={"enable_kv_cache_events":true,"endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"kv@$(POD_NAME)@Qwen/Qwen3-8B"}
           ports:
             - { containerPort: 8000, name: prefill-http }
             - { containerPort: 5557, name: kv-events }
             - { containerPort: 5558, name: kv-replay }
+          env:
+            - name: POD_NAME                     # 供上面 topic 里的 $(POD_NAME) 展开
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
 ```
 
 **decode Deployment**（sidecar + vLLM，对照 `deploy/components/vllm-decode/deployment.yaml`）：
@@ -239,11 +243,14 @@ spec:
             - --model=Qwen/Qwen3-8B
             - --port=8200                        # 只对 localhost 暴露，默认值就是它
             - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_both"}
-            - --kv-events-config={"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558"}
+            - --kv-events-config={"enable_kv_cache_events":true,"endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"kv@$(POD_NAME)@Qwen/Qwen3-8B"}
           ports:
             - { containerPort: 8200, name: http }
             - { containerPort: 5557, name: kv-events }
             - { containerPort: 5558, name: kv-replay }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
           startupProbe:                          # 模型加载慢，先扛住 10 分钟
             httpGet: { path: /health, port: 8200 }
             failureThreshold: 60
@@ -377,6 +384,39 @@ rules:
 
 **这份配置不需要 `--allow-experimental-plugins`**：用到的 `precise-prefix-cache-producer`、`prefix-cache-scorer`、`disagg-profile-handler`、`prefix-based-pd-decider`、`endpoint-notification-source`、`token-producer` **全部是 Beta**（`runner.go:619-708` 逐个都是 `StabilityBeta`）。上游 dev 环境把那个 flag 设成 `true` 是因为它还要跑别的场景（`burst-prefix`、`multicluster-*`、`disaggregated-set-rollout` 这些才是 Alpha）。
 
+**`vllm-render`**（`token-producer` 的分词后端，对照 `deploy/environments/dev/base-kind-istio/vllm-render.yaml`）：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: vllm-render, namespace: llm-d, labels: { app: vllm-render } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: vllm-render } }
+  template:
+    metadata: { labels: { app: vllm-render } }
+    spec:
+      containers:
+        - name: vllm-render
+          image: vllm/vllm-openai-cpu:v0.21.0   # CPU 镜像就够，它只分词不推理
+          command: ["vllm", "launch", "render"]
+          args: ["Qwen/Qwen3-8B", "--port=8082"]
+          ports: [{ name: render-http, containerPort: 8082 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 8082 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata: { name: vllm-render, namespace: llm-d }
+spec:
+  selector: { app: vllm-render }
+  type: ClusterIP
+  ports: [{ name: http, port: 8082, targetPort: 8082 }]
+```
+
+**这个组件容易被漏掉**：它不在推理数据通路上，纯粹是给 `token-producer` 提供 HTTP 分词接口用的（§1.2 里 `vllm.url` 指的就是它）。**它不可用 = 请求分不了词 = DataProducer 失败 = 前缀路由静默退化成纯负载均衡**（总表 #10）。用 CPU 镜像是刻意的——分词不需要 GPU，别为它占一张卡。注意 `args` 里的模型名要和 `token-producer.modelName`、以及 KV 事件 topic 的 model 段三者一致。
+
 **HTTPRoute**（Gateway 模式，把流量指向池子）：
 
 ```yaml
@@ -430,6 +470,56 @@ spec:
 
 **选哪个**：要 replay 恢复能力（EPP 重启后不用慢慢重建索引）就只能用模式 B；只是想快速验证、或者引擎侧不方便暴露端口，模式 A 更省事。
 
+### 1.5 vLLM 侧的两个参数，以及那个必须配的 topic
+
+字段以 vLLM 的 `KVTransferConfig`（`vllm/config/kv_transfer.py`）和 `KVEventsConfig`（`vllm/config/kv_events.py`）为准。
+
+**`--kv-transfer-config`** —— 让 vLLM 具备跨实例搬 KV 的能力，P/D 的前提：
+
+| 字段 | 本示例的值 | 说明 |
+|------|-----------|------|
+| `kv_connector` | `NixlConnector` | 注册名见 `kv_connector/factory.py:176-180`，必须大小写一致 |
+| `kv_role` | `kv_both` | 三选一：`kv_producer` / `kv_consumer` / `kv_both`。prefill 只产、decode 只消，但两边都配 `kv_both` 最省事，也便于角色互换 |
+
+**漏了它的后果**：sidecar 的 prefill 请求拿不到 `kv_transfer_params`，decode 侧只能自己重算 prefill——**P/D 白配，但请求全部成功**（总表 #13）。
+
+**`--kv-events-config`** —— 让 vLLM 把 KV 变动广播出来，精确前缀索引的前提：
+
+| 字段 | 默认值 | 本示例的值 | 说明 |
+|------|--------|-----------|------|
+| `enable_kv_cache_events` | `false` | `true` | 总开关 |
+| `publisher` | 随开关自动变 `zmq` | 省略 | `__post_init__` 里开关为 true 时自动置 `zmq`，不用显式写 |
+| `endpoint` | **`tcp://*:5557`** | 同默认值 | 引擎 bind 的 PUB 地址。默认值正好就是模式 B 要的 |
+| `replay_endpoint` | `None` | `tcp://*:5558` | **不配就没有 replay**，EPP 重启后索引只能靠新流量慢慢重建 |
+| `buffer_steps` | `10000` | 省略 | replay 能回放多少步的历史 |
+| **`topic`** | **`""`** | **`kv@<pod>@<model>`** | **见下** |
+
+**`topic` 是最容易漏、而且漏了完全静默的一个**。两边的默认值天生不匹配：
+
+```
+vLLM  端：topic 默认 ""，且原样作为 ZMQ 消息的第一帧发出（kv_events.py:464）
+llm-d 端：SUB socket 订阅过滤器默认 "kv@"（pool.go:153）
+          ZMQ 的 SUB 过滤是【首帧前缀匹配】
+          "" 不以 "kv@" 开头 → 一条都收不到
+```
+
+而且不只是要以 `kv@` 开头，**格式必须是 `kv@<pod-id>@<model-name>` 三段**，因为 llm-d 要从里面切出 pod 身份和模型名：
+
+```go
+// pkg/kvevents/engineadapter/common.go:46-52
+func parseTopic(topic string) (string, string) {
+	topicParts := strings.Split(topic, "@")
+	if len(topicParts) == 3 {
+		return topicParts[1], topicParts[2]
+	}
+	return topic, ""      // ← 段数不对就退化：整串当 podID，模型名为空
+}
+```
+
+段数不对时不报错，只是模型名变成空串。这在模式 A（靠 topic 认 pod）下会直接错乱；模式 B 下 pod 身份由 `SourceEndpoint` 覆盖（`pool.go:397-399`）所以还能work，但模型名依旧是空的。
+
+所以本示例用 downward API 注入 `POD_NAME`，再拼成 `kv@$(POD_NAME)@Qwen/Qwen3-8B`。**model 段要和 `token-producer.modelName` 完全一致**——两边都参与 block hash 的计算，不一致就是命中率恒 0（04 §4.3）。
+
 ## 2. 端到端 Demo
 
 跑 [00 篇 §2 的统一示例](00-总览与架构.md#2-统一示例贯穿-0007-篇)：2048 token 的共享系统提示 S，请求 A 是 `S + 40 token 的问题`，请求 B 是 `S + 24 token 的问题`。目标是**亲眼看到 B 命中了 A 留下的 KV**。
@@ -438,10 +528,12 @@ spec:
 
 ```bash
 export NS=llm-d
-kubectl apply -f prefill-deploy.yaml -f decode-deploy.yaml \
+kubectl apply -f vllm-render.yaml \
+               -f prefill-deploy.yaml -f decode-deploy.yaml \
                -f epp-config.yaml -f epp-deploy.yaml \
                -f inferencepool.yaml -f httproute.yaml
-kubectl -n $NS rollout status deploy/llama-8b-prefill deploy/llama-8b-decode deploy/llama-8b-epp
+kubectl -n $NS rollout status deploy/vllm-render deploy/llama-8b-prefill \
+                              deploy/llama-8b-decode deploy/llama-8b-epp
 ```
 
 ### 2.2 冒烟：EPP 看得见所有 endpoint 吗
@@ -471,32 +563,53 @@ kubectl -n $NS exec deploy/llama-8b-epp -- curl -s localhost:9090/metrics | grep
 
 ### 2.3 请求 A：冷启动，走完整的 P/D
 
+先把两个请求体生成成文件。**不要在 shell 里手拼 JSON**——系统提示有几千字符，引号和换行一定会出问题；用 `jq` 构造，再用 `--data-binary @file` 发：
+
 ```bash
 GW=$(kubectl -n $NS get gateway inference-gateway -o jsonpath='{.status.addresses[0].value}')
+MODEL=Qwen/Qwen3-8B
 
-# 构造 2048 token 的系统提示（粗略按 4 字符 ≈ 1 token）
-SYS=$(python3 -c "print('You are a senior Go engineer. Follow these rules strictly. ' * 150)")
+# 共享的长系统提示。重复次数只是为了凑长度，具体多少 token 下一步实测
+SYS=$(python3 -c "print('You are a senior Go engineer. Follow these rules strictly. ' * 150, end='')")
 
-curl -s "http://$GW/v1/chat/completions" -H 'Content-Type: application/json' -d "{
-  \"model\": \"Qwen/Qwen3-8B\",
-  \"messages\": [
-    {\"role\": \"system\", \"content\": \"$SYS\"},
-    {\"role\": \"user\",   \"content\": \"请解释 sync.Map 的适用场景。\"}
-  ]
-}" | jq -r '.choices[0].message.content' | head -3
+jq -n --arg m "$MODEL" --arg s "$SYS" --arg q '请解释 sync.Map 的适用场景。' \
+  '{model:$m, messages:[{role:"system",content:$s},{role:"user",content:$q}]}' > req-a.json
+jq -n --arg m "$MODEL" --arg s "$SYS" --arg q '请解释 channel 的关闭语义。' \
+  '{model:$m, messages:[{role:"system",content:$s},{role:"user",content:$q}]}' > req-b.json
 ```
 
-这一发请求应该发生的事，按 01 篇的五个阶段：
+**先量出真实 token 数再对照后面的推演**，别用"4 字符 ≈ 1 token"估：
+
+```bash
+# 用 EPP 分词用的那个 render 实例来数，口径和 token-producer 完全一致
+TOK() { jq -c '{model:.model, messages:.messages}' "$1" \
+  | kubectl -n $NS exec -i deploy/vllm-render -- \
+      curl -s localhost:8082/tokenize -H 'Content-Type: application/json' --data-binary @- \
+  | jq '.count'; }
+A_TOKENS=$(TOK req-a.json); B_TOKENS=$(TOK req-b.json)
+echo "A=$A_TOKENS  B=$B_TOKENS  共享前缀≈$((B_TOKENS - 12)) token"
+
+# 精确路线 block size 16 下，各自能切出多少个完整块（残块会被丢弃）
+echo "A blocks=$((A_TOKENS / 16))  B blocks=$((B_TOKENS / 16))"
+```
+
+拿到真实数字后，这一发请求应该发生的事（下面用 `A_TOKENS` 指代实测值，示意值按 2088 写）：
 
 ```
 EPP:  阶段 C  Locate → 6 个 endpoint，decode-filter/prefill-filter 各自筛出 4 / 2 个
-      阶段 D  token-producer      → 2088 token
-              precise producer    → 130 个完整 block，Index.Lookup 全空（首次）
+      阶段 D  token-producer      → A_TOKENS 个 token（示意 2088）
+              precise producer    → ⌊A_TOKENS/16⌋ 个完整 block（示意 130），
+                                    Index.Lookup 全空（首次）
       阶段 E  decode profile  → prefix 分全 0，纯看队列与 KV → 选中某个 D
-              prefill profile → decider：未命中 2088 > 512 → 要分离 → 选中某个 P
+              prefill profile → decider：未命中 A_TOKENS > 512 → 要分离 → 选中某个 P
               primary = decode
 sidecar: 读 x-prefiller-host-port → 调 P:8000（max_tokens=1）
          → 拿回 kv_transfer_params → 交给本地 vLLM:8200 → NIXL 拉 KV → 出 token
+```
+
+```bash
+curl -s "http://$GW/v1/chat/completions" -H 'Content-Type: application/json' \
+  --data-binary @req-a.json | jq -r '.choices[0].message.content' | head -3
 ```
 
 逐条验证：
@@ -517,26 +630,24 @@ kubectl -n $NS exec deploy/llama-8b-epp -- curl -s localhost:9090/metrics | grep
 ### 2.4 请求 B：同一个前缀，验证命中
 
 ```bash
-curl -s "http://$GW/v1/chat/completions" -H 'Content-Type: application/json' -d "{
-  \"model\": \"Qwen/Qwen3-8B\",
-  \"messages\": [
-    {\"role\": \"system\", \"content\": \"$SYS\"},
-    {\"role\": \"user\",   \"content\": \"请解释 channel 的关闭语义。\"}
-  ]
-}" | jq -r '.choices[0].message.content' | head -3
+curl -s "http://$GW/v1/chat/completions" -H 'Content-Type: application/json' \
+  --data-binary @req-b.json | jq -r '.choices[0].message.content' | head -3
 ```
 
-这一发应该发生的事**和 A 完全不同**：
+这一发应该发生的事**和 A 完全不同**（`SHARED` = 共享系统提示的 token 数，示意 2048）：
 
 ```
-阶段 D  precise producer → 129 个 block，前 128 块与 A 的 hash 完全相同
-                           Index.Lookup → 命中 128 块在 A 落中的那个 D 上
-                           matchBlocks=128, totalBlocks=129
-阶段 E  decode profile  → prefix-cache-scorer 给那个 D 打 128/129 × 2 = 1.98 分
+阶段 D  precise producer → ⌊B_TOKENS/16⌋ 个 block（示意 129），
+                           前 ⌊SHARED/16⌋ 块（示意 128）与 A 的 hash 完全相同
+                           Index.Lookup → 命中那些块在 A 落中的那个 D 上
+                           matchBlocks=128, totalBlocks=129（示意）
+阶段 E  decode profile  → prefix-cache-scorer 给那个 D 打 128/129 × 2 ≈ 1.98 分
                            足以盖过队列与 KV 的劣势 → B 落到同一个 D
-        prefill profile → decider：未命中只有 24 个 token < 512
+        prefill profile → decider：未命中 = B_TOKENS − 命中块×16（示意 24）< 512
                            → 判定不值得分离，不跑 prefill！
 ```
+
+**这里的两个 512 边界要自己核一遍**：A 要走 P/D 需要 `A_TOKENS ≥ 512`，B 要不走 P/D 需要 `B_TOKENS − 命中 token 数 < 512`。用上一步实测的数字代入确认，否则 demo 的两个分支可能都落在同一边。
 
 **两个观察点，一个证明前缀路由生效、一个证明 decider 生效**：
 
@@ -544,7 +655,7 @@ curl -s "http://$GW/v1/chat/completions" -H 'Content-Type: application/json' -d 
 # ① 前缀命中——这是唯一可靠的验证手段，不能只看配置
 kubectl -n $NS exec deploy/llama-8b-epp -- \
   curl -s localhost:9090/metrics | grep request_cached_tokens
-#    期望：分布里出现 ~2048 的那一档。仍然全 0 → 查 §3 表里的 #1~#6
+#    期望：分布里出现接近共享前缀长度的那一档。仍然全 0 → 查 §3 表里的 #1~#6
 
 # ② A 和 B 落到了同一个 pod（需要 --emit-endpoint-scores，看 Envoy access log 的
 #    dynamic metadata，或直接比对两个 decode pod 的请求计数）
@@ -555,7 +666,7 @@ kubectl -n $NS exec deploy/llama-8b-prefill -- curl -s localhost:8000/metrics | 
 kubectl -n $NS logs deploy/llama-8b-decode -c routing-sidecar | grep 'skip disaggregated prefill'
 ```
 
-第 ③ 条是这个 demo 最有意思的地方：**前缀缓存命中反过来让 P/D 分离变得不必要了**。B 的 2048 token 已经在本地 decode pod 的 KV 里，只有 24 个 token 需要 prefill，本地算比跨节点搬运更快，于是 decider 走了 06 篇 §2 的分支 ④，sidecar 退化成透明代理。**这两个机制不是各自独立的，它们会互相影响** —— 把 `nonCachedTokens` 改回上游的 16，B 就又会去走 prefill 了，可以改一下 ConfigMap 重启 EPP 对比看。
+第 ③ 条是这个 demo 最有意思的地方：**前缀缓存命中反过来让 P/D 分离变得不必要了**。B 的那几千个共享 token 已经在本地 decode pod 的 KV 里，只剩几十个 token 需要 prefill，本地算比跨节点搬运更快，于是 decider 走了 06 篇 §2 的分支 ④，sidecar 退化成透明代理。**这两个机制不是各自独立的，它们会互相影响** —— 把 `nonCachedTokens` 改回上游的 16，B 就又会去走 prefill 了，可以改一下 ConfigMap 重启 EPP 对比看。
 
 ### 2.5 最后确认没有静默降级
 
@@ -600,6 +711,9 @@ kubectl -n $NS logs deploy/llama-8b-epp | grep -c 'Filter eliminated all endpoin
 | 22 | **sidecar 的 `restartPolicy: Always` 漏了** | 它退化成普通 init 容器，跑完就退出 | pod 起不来或 8000 无人监听 | 07 §1.3 |
 | 23 | **`prefix-based-pd-decider` 漏 `prefixMatchInfoProducerName`** | decider 读近似数据、scorer 读精确数据，两个粒度并存 | 看有没有多出一个 `approx-prefix-cache-producer` | 07 §1.2 |
 | 24 | **ZMQ 两种拓扑混配** | EPP 上一个没人连的 5557 空监听，真正订阅走另一条路 | `zmqEndpoint` 与 `podDiscoveryConfig` 只该配一个 | 07 §1.4 |
+| 25 | **vLLM 的 `topic` 没配成 `kv@…` 三段式** | SUB 过滤器不匹配，**一条 KV 事件都收不到**，索引恒空 | `kv_block` 指标为 0；vLLM 侧 `topic` 默认是空串 | 07 §1.5 |
+| 26 | **漏配 `replay_endpoint`** | EPP 重启后索引只能靠新流量重建，期间命中率为 0 | vLLM 侧默认 `None` | 07 §1.5 |
+| 27 | **`vllm-render` 没部署或不可用** | 请求分不了词 → DataProducer 失败 → 退化成纯负载均衡 | 日志 `failed to prepare per request data` | 07 §1.3 |
 
 **与之相对的好消息**：下面这些是**启动期硬失败**，配错了 EPP 根本起不来，不用担心它们静默生效——`--pool-name` 与 `--endpoint-selector` 都给或都不给、插件参数有未知字段、`pluginRef` 指向不存在的插件、配了两个或零个 ProfileHandler、多 profile 用了 `single-profile-handler`、Alpha 插件没加 `--allow-experimental-plugins`、未知的 feature gate 名。
 
