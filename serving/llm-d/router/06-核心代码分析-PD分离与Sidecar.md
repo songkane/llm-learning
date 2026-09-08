@@ -68,8 +68,11 @@ func main() {
 |---|------|------|
 | **sidecar** | **8000**（`--port`） | **Envoy 打的是这个**；InferencePool 的 targetPort 也指这个 |
 | 本地 vLLM | 8200（`--model-server-port`） | 只有 sidecar 访问，不对外 |
+| **prefill pod 的 vLLM** | **8000** | prefill **没有 sidecar**，vLLM 直接占用池子的 targetPort（`vllm-prefill/deployment.yaml:29`） |
 | metrics | `--metrics-port`（默认 0 = 关） | sidecar 自己的指标 |
 | DP rank r | sidecar `8000+r` → vLLM `8200+r` | `data_parallel.go:54-86` |
+
+**两种角色对外都是 8000**，这不是巧合：`InferencePool` 只有一个 `targetPorts`，decode 用它暴露 sidecar、prefill 用它暴露 vLLM，池子就不必为角色区分端口（07 §1.1）。
 
 ```go
 // pkg/sidecar/proxy/proxy_helpers.go:33-38（节选）
@@ -96,7 +99,9 @@ POST /inference/v1/generate    ┘
 其他所有路径                    → 直接透传给本地 decoder
 ```
 
-**只有这五条路径走 P/D 编排**，`/health`、`/metrics`、`/v1/models` 等一律透传。
+**只有这五条路径走 P/D 编排**，其余一律由兜底的 `mux.Handle("/", s.decoderProxy)`（`proxy.go:635`）反向代理给本地 vLLM，`/metrics`、`/v1/models` 都在其中。
+
+**`GET /health` 是唯一的例外**：它由 sidecar 自己应答，无条件 `WriteHeader(http.StatusOK)`（`proxy.go:624-626`），**根本没问过 vLLM**。所以拿 sidecar 端口做健康检查只能证明代理活着，不能证明引擎能推理——K8s 探针要直接打 vLLM 的 8200。
 
 ### 1.3 关键 CLI flag
 
@@ -366,7 +371,7 @@ LRU 缓存的作用：同一个 prefill host 的 engine map 不会每个请求�
 // pkg/sidecar/proxy/chat_completions.go:146-158（节选）
 ```
 
-`x-kv-cache-source-host-port` 格式不对、或当前 connector 不支持 P2P，**静默忽略**这个 header，走正常 P/D。没有报错、没有 warning。这是 07 篇排障清单上的一条。
+`x-kv-cache-source-host-port` 格式不对、或当前 connector 不支持 P2P，**静默忽略**这个 header，走正常 P/D。没有报错、没有 warning。这是 [07 篇 §3 静默失效总表](07-部署示例与端到端Demo.md#3-静默失效模式总表)上的一条。
 
 ## 5. E/P/D：Encode 分离
 
@@ -583,26 +588,28 @@ Coordinator 目前是实验特性，生产用要评估风险。
 
 ## 8. 用示例串一遍
 
-请求 A（假设 prompt 长、`prefix-based-pd-decider` 判定该分离），NIXLv2 connector：
+统一示例的请求 A（2088 token，首个请求所以前缀全未命中，`prefix-based-pd-decider` 判定该分离），NIXLv2 connector：
 
 ```
 EPP（01 篇）:
   Scheduler:
     Pick → {"decode"}   decode-filter → [D1..D4] → 选 D3
-    Pick → {"prefill"}  ← prefix-based-pd-decider：未命中 token 40 > 16，要分离
+    Pick → {"prefill"}  ← prefix-based-pd-decider：未命中 2088 token > nonCachedTokens 16
+                          （A 是首个请求，索引里没有它的前缀）→ 要分离
                         prefill-filter → [P1,P2] → 选 P1
     Pick → {}
     ProcessResults → PrimaryProfileName="decode"
   prepareRequest:
     TargetEndpoint = "10.0.1.7:8000"          ← D3 的 sidecar 端口，不是 vLLM 端口
     PreRequest（disagg-profile-handler）:
-      Headers["x-prefiller-host-port"] = "10.0.2.3:8100"   ← P1 的 vLLM 端口
+      Headers["x-prefiller-host-port"] = "10.0.2.3:8000"   ← P1 的 vLLM 端口
+                                                            （prefill 无 sidecar，vLLM 直接占 8000）
   → Envoy: envoy.lb/x-gateway-destination-endpoint = 10.0.1.7:8000
 
 Envoy → D3:8000（sidecar）
 
 sidecar disaggregatedPrefillHandler:
-  读 x-prefiller-host-port = "10.0.2.3:8100"，随即 Header.Del
+  读 x-prefiller-host-port = "10.0.2.3:8000"，随即 Header.Del
   无 encoder header，有 prefill → handlePDConnector → handleNIXLV2
 
   ① 生成 request_id
@@ -610,7 +617,7 @@ sidecar disaggregatedPrefillHandler:
        max_tokens = 1
        stream = false
        kv_transfer_params = {do_remote_decode: true, do_remote_prefill: false}
-     POST http://10.0.2.3:8100/v1/chat/completions   （同步等待）
+     POST http://10.0.2.3:8000/v1/chat/completions   （同步等待）
 
   ② P1 的 vLLM 算完 prefill，产出 KV，返回：
      {..., "kv_transfer_params": {"remote_engine_id": "...",
@@ -664,7 +671,7 @@ docs/disaggregation.md                          上游 P/D 文档
 
 ```
 Envoy → 8000（sidecar）→ localhost:8200（本地 vLLM）
-                       → prefill-pod:8100（远端 vLLM）
+                       → prefill-pod:8000（远端 vLLM，无 sidecar）
 Mooncake bootstrap: 8998
 P2P connector:      7777
 DP rank r:          sidecar 8000+r → vLLM 8200+r
@@ -701,4 +708,4 @@ DP rank r:          sidecar 8000+r → vLLM 8200+r
 
 ---
 
-**上一篇**：[05 · Flow Control 流控与准入](05-核心代码分析-FlowControl流控与准入.md) ｜ **下一篇**：[07 · 部署配方与排障](07-部署配方与排障.md)
+**上一篇**：[05 · Flow Control 流控与准入](05-核心代码分析-FlowControl流控与准入.md) ｜ **下一篇**：[07 · 部署示例与端到端 Demo](07-部署示例与端到端Demo.md)

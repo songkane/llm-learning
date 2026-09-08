@@ -2,7 +2,8 @@
 
 > **源码基线**：[`main @ 90a28bc`](https://github.com/llm-d/llm-d-router/tree/90a28bc66f1d96f84f8f18f11dcd6ed15f34e830)
 > 本篇的代码在 `pkg/kvcache`（3621 行，索引与打分）与 `pkg/kvevents`（2642 行，ZMQ 事件摄取）两个包里，都随 EPP 同进程运行，无需单独部署。
-> 本篇回答 [00 篇](00-总览与架构.md#2-统一示例贯穿-0007-篇) 的第 4 个问题：**请求 B 进来时，EPP 怎么知道 D3 上已经有那 12 个 token 的 KV？**
+> 本篇回答 [00 篇](00-总览与架构.md#2-统一示例贯穿-0007-篇) 的第 4 个问题：**请求 B 进来时，EPP 怎么知道 D3 上已经有那 2048 token 前缀的 KV？**
+> 本篇也划出这套机制的**下界**：共享前缀短到什么程度就完全失效（§4.2、§9.2）。
 
 ## 0. 两条路线，一个目标
 
@@ -429,7 +430,19 @@ func (p *dataProducer) GetBlockSize(endpoints []fwksched.Endpoint) int {
 
 **这是内存与精度的直接取舍**：近似索引是「每 pod × 每 block」一个 LRU 条目，block 越小条目越多。64 token 的粒度意味着**不足 64 token 的共享前缀检测不到**。
 
-回到统一示例：请求 A/B 共享 12 个 token 的系统提示——**在近似路线下这个前缀根本形不成一个完整 block，检测不到**。要让 12 token 的共享前缀生效，得用精确路线（block size 16，且要考虑 §4.5 的 partial block 处理）。这是个实际的、容易被忽略的限制：**短系统提示的共享靠近似路线是抓不住的。**
+回到统一示例：A/B 共享 2048 token 的系统提示，`2048 / 64 = 32` 个完整 block，**整齐地跨过 32 个 block 边界**，所以近似路线能命中 32 块（01 篇 §8、02 篇 §3.4 算过）。这个示例之所以定成 2048 token，就是为了落在这条下限之上。
+
+**下限之下会发生什么，值得单独算一遍**。假设把系统提示换成 `"你是一个资深 Go 工程师。"` 这样 12 个 token 的一句话：
+
+| | 近似路线（block size ≥64） | 精确路线（block size 16） |
+|---|--------------------------|--------------------------|
+| 共享 12 token 能凑几个完整 block | `12/64 = 0` | `12/16 = 0` |
+| 第 1 个 block 的内容 | A、B 各自的前 64 token（含各自的问题）→ hash 不同 | A、B 各自的前 16 token → hash 不同 |
+| 匹配结果 | **0 块，命中率 0** | **0 块，命中率 0** |
+
+**两条路线都抓不住**——因为匹配粒度是 block 不是 token，共享前缀跨不过第一个 block 边界，第一个 block 的 hash 就已经不一样了（完整推演见 §9.2）。所以这不是"近似路线的缺陷"，而是 block 粒度的固有下界；近似路线的 64 token 硬下限只是把这个门槛又抬高了 4 倍。
+
+**实践结论**：**共享前缀必须显著长于 block size，前缀缓存路由才有意义。** 近似路线要求 ≥64 token（且要跨过完整块），精确路线可以低到 16 token。真实的 agentic / 长系统提示场景（几百到几千 token）天然满足，短提示场景收益接近零——而且**失败是静默的**，配置一切正常、请求全部成功，只有命中率是 0。
 
 ### 4.3 Hash 算法与「不必等于 vLLM」
 
@@ -698,7 +711,9 @@ info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTok
 | 失效机制 | LRU 淘汰 + 定期清理 inactive pod | 引擎的 `BlockRemoved` / `AllBlocksCleared` + dedup |
 | 多 EPP 副本 | **不共享**（HA 下命中率腰斩） | Redis 后端可共享 |
 | 依赖引擎配置 | 无 | vLLM 需开 KV 事件发布 + ZMQ 端口 |
-| 12-token 共享前缀 | **检测不到**（<64 token 下限） | 检测得到（若 ≥1 个完整 block） |
+| 共享前缀的最小可用长度 | **≥64 token**（硬下限），且要凑满完整 block | **≥1 个完整 block**（默认 16 token） |
+| 统一示例的 2048 token 前缀 | 命中 32/33 块 | 命中 128/129 块 |
+| 12 token 的短前缀 | 检测不到 | **也检测不到**（跨不过 16 token 的块边界） |
 
 引擎兼容性差异（这张表在上游 README 里，很关键）：
 
@@ -718,7 +733,8 @@ info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTok
 |------|---|
 | 快速上手、单 EPP、长系统提示（≥64 token） | **近似**（默认，零配置） |
 | 多 EPP 副本 / HA | **精确 + Redis**（近似在 HA 下无效） |
-| 短共享前缀（<64 token） | **精确** |
+| 共享前缀 16~64 token | **精确**（近似的 64 硬下限抓不住） |
+| 共享前缀 < 16 token | **两个都没用**，别在前缀路由上投入 |
 | KV offload 到 CPU/磁盘，想让路由感知 tier | **精确**（近似不知道 tier） |
 | SGLang + cache_salt | 两个都不理想，评估收益后再决定 |
 
@@ -883,7 +899,9 @@ func isPrefixIndexableSpecKind(kind KVCacheSpecKind) bool {
 
 ## 9. 用示例串一遍
 
-请求 A 和 B 在**精确路线**下（block size 16，A/B 共享 12 token 系统提示 + 各自的问题）：
+### 9.1 命中的情形：2048 token 共享前缀
+
+统一示例（00 篇 §2）走**精确路线**，block size 16。A 共 2088 token，B 共 2072 token，共享的系统提示 S 是 2048 token —— `2048 / 16 = 128`，**正好 128 个完整 block**：
 
 ```
 准备阶段（pod D3 启动后）
@@ -892,58 +910,89 @@ func isPrefixIndexableSpecKind(kind KVCacheSpecKind) bool {
                         replay 端口 10.0.1.7:5558（DEALER）
     → 无 lastSeq，首个事件 seq>0 → requestReplay(0) 拉全量历史
 
-T=0  请求 A 到达
+T=0  请求 A 到达（2088 token = S 的 2048 + QA 的 40）
      DataProducer:
-       token-producer → tokens = [t1..t12（系统提示）, t13..t40（A 的问题）]
+       token-producer → tokens = [s1..s2048（系统提示）, a1..a40（A 的问题）]
        precise-prefix-cache-producer:
-         chunkTokens(40 tokens, bs=16) → 2 个完整 block（32 token），后 8 个丢弃
-         prefixHashes → [R1, R2]
-         Index.Lookup([R1,R2], {D1..D4}) → 空（首次）
-         → PrefixCacheMatchInfo{matchBlocks:0, totalBlocks:2} 写到每个 endpoint
-     Scorer: prefix-cache-scorer → 全 0
+         chunkTokens(2088 tokens, bs=16)
+           → 130 个完整 block（2080 token），尾部 8 个 token 丢弃（§4.5）
+           → 前 128 块全部来自 S，第 129 块 = a1..a16，第 130 块 = a17..a32
+         prefixHashes → [R1 .. R130]（链式，每块的 hash 含父块 hash）
+         Index.Lookup([R1..R130], {D1..D4}) → 空（首次）
+         → PrefixCacheMatchInfo{matchBlocks:0, totalBlocks:130} 写到每个 endpoint
+     Scorer: prefix-cache-scorer → 全 0（纯负载均衡，明细见 02 篇 §3.4）
      Picker: 按 queue + kv 分选中 D3
      PreRequest:
-       speculativeIndexing=true → Index.Add(nil, [R1,R2], [{D3, Speculative:true}])
+       speculativeIndexing=true → Index.Add(nil, [R1..R130], [{D3, Speculative:true}])
                                   TTL 2s
 
 T=0.15s  vLLM D3 算完 prefill，存了 block
          ZMQ PUB → topic="kv@d3-pod@llama-8b", seq=1041
-                   payload = BlockStored{BlockHashes:[E1,E2], Tokens:[...], ParentHash:0}
+                   payload = BlockStored{BlockHashes:[E1..E130], Tokens:[...], ParentHash:0}
          zmqSubscriber 收到，seq 连续 → AddTask
          Pool.AddTask: key = SourceEndpoint = "10.0.1.7:8000"
                        FNV-1a % 4 → queue 2
          worker 2 处理:
            ParentHash=0 → parentRequestKey = EmptyBlockHash
-           用 Tokens 重算 → requestKeys = [R1, R2]   ← 与读路径同一算法，必然对上
-           Index.Add([E1,E2], [R1,R2], [{D3, tier:"GPU"}])
-             同时建 E1→R1、E2→R2 映射（供将来 BlockRemoved 反查）
+           用 Tokens 重算 → requestKeys = [R1..R130]  ← 与读路径同一算法，必然对上
+           Index.Add([E1..E130], [R1..R130], [{D3, tier:"GPU"}])
+             同时建 Eᵢ→Rᵢ 映射（供将来 BlockRemoved 反查）
+           ← 这一步把 T=0 时那批 Speculative 条目换成了引擎确认过的事实
 
-T=1.0s  请求 B 到达
+T=1.0s  请求 B 到达（2072 token = S 的 2048 + QB 的 24）
      precise producer:
-       tokens = [t1..t12（同前缀）, t41..t60（B 的问题）]
-       chunkTokens(32 tokens, bs=16) → 2 个 block
-       第 1 个 block = t1..t16 —— 包含共享的 12 token + B 特有的 4 个
-         → hash 与 A 的 R1 不同！
-       Index.Lookup([R1', R2']) → 空
+       tokens = [s1..s2048（同一个 S）, b1..b24（B 的问题）]
+       chunkTokens(2072 tokens, bs=16)
+           → 129 个完整 block（2064 token），尾部 8 个丢弃
+           → 前 128 块来自 S —— 与 A 的前 128 块 token 完全相同、父链完全相同
+                             → hash 完全相同：R1..R128
+           → 第 129 块 = b1..b16 ≠ a1..a16 → hash 不同
+       Index.Lookup([R1..R128, R129'], {D1..D4})
+         → R1..R128 全部命中 {D3}，R129' 未命中
+         → 最长前缀匹配在第 128 块处截断
+         → PrefixCacheMatchInfo{matchBlocks:128, totalBlocks:129} 写到 D3
+                               {matchBlocks:0,   totalBlocks:129} 写到 D1/D2/D4
+     Scorer: prefix-cache-scorer → D3: 128/129 = 0.992，× weight 3 = 2.98 分
+     Picker: D3（算式见 02 篇 §3.4）
+     → D3 的 vLLM 命中本地 2048 token 的 KV，prefill 只需算 QB 那 24 个 token
 ```
 
-**注意最后这个结果**：**12 token 的共享前缀跨不过 16 token 的 block 边界，精确路线也检测不到。**
+**这就是完整闭环**：A 的 prefill 结果通过 ZMQ 事件变成索引里的事实，B 靠这份索引找到 D3，省掉 2048 token 的 prefill 重算。
 
-这是本篇最需要理解的机制性限制：**前缀缓存的粒度是 block，不是 token。** 共享前缀必须至少填满一个完整 block（且 block 边界对齐）才能被检测到。12 < 16，A 和 B 的第一个 block 就已经不同了。
+### 9.2 落空的情形：12 token 共享前缀
 
-要让示例真的命中，系统提示得长于 block size。改成 20 token 的系统提示 + block size 16：
+同一套配置，只把系统提示换成 `"你是一个资深 Go 工程师。"`（12 token）：
 
 ```
-A: [s1..s16 | s17..s20, a1..a12 | ...]   第 1 个 block = s1..s16
-B: [s1..s16 | s17..s20, b1..b9  | ...]   第 1 个 block = s1..s16   ← 相同！
+A: tokens = [s1..s12, a1..a40]        共 52 token
+   chunkTokens(52, bs=16) → 3 个完整 block，尾部 4 个丢弃
+   第 1 个 block = s1..s12 + a1..a4    ← 含 A 特有的 4 个 token
+     → hash R1
+
+B: tokens = [s1..s12, b1..b24]        共 36 token
+   chunkTokens(36, bs=16) → 2 个完整 block，尾部 4 个丢弃
+   第 1 个 block = s1..s12 + b1..b4    ← 含 B 特有的 4 个 token
+     → hash R1'  ≠ R1
      ↓
-Index.Lookup([R1, ...]) → R1 命中 {D3}
-  → PrefixCacheMatchInfo{matchBlocks:1, totalBlocks:2}
-  → prefix-cache-scorer: 1/2 = 0.5，× weight 3 = 1.5 分给 D3
-  → 大概率选中 D3，省下 16 个 token 的 prefill
+Index.Lookup([R1', R2']) → 空
+PrefixCacheMatchInfo{matchBlocks:0, totalBlocks:2}
+prefix-cache-scorer → 全 0
+→ B 被 no-hit-lru-scorer 推去别的 pod，共享的这 12 个 token 一个也没省下
 ```
 
-**实践含义**：想让前缀缓存路由有效，系统提示（或共享的 few-shot 示例）应该显著长于 block size。近似路线的 64 token 下限意味着这个要求更高。真实的 agentic / 长系统提示场景（几百到几千 token）天然满足，短提示场景收益有限——上游把 `agentic-serving` 单列一条 well-lit path 就是这个道理。
+**共享前缀跨不过第一个 block 边界，两条路线都归零。** 12 < 16，A 和 B 的**第 1 个 block 就已经不同**——因为 block 里混进了各自的问题 token，而 hash 是整块算的。近似路线更糟：block size 硬下限 64，连 §9.1 那种 16 token 粒度的机会都没有。
+
+### 9.3 两个情形的对比
+
+| | 9.1（S = 2048 token） | 9.2（S = 12 token） |
+|---|---------------------|-------------------|
+| 共享前缀能凑满几个完整 block | `2048/16 = 128` | `12/16 = 0` |
+| B 的 match ratio | `128/129 = 0.992` | `0/2 = 0` |
+| `prefix-cache-scorer` 给 D3 的分（weight 3） | **2.98** | **0** |
+| 结果 | B 落到 D3，省 2048 token 的 prefill | B 被分散策略推走，一点也没省 |
+| 有报错吗 | — | **没有。配置正确、请求全成功、命中率 0** |
+
+**实践含义**：想让前缀缓存路由有效，系统提示（或共享的 few-shot 示例）必须**显著长于 block size**——不是"长于"，而是要能凑满若干个完整块，因为混进请求特有 token 的那个块就废了。真实的 agentic / 长系统提示场景（几百到几千 token）天然满足，短提示场景收益接近零，上游把 `agentic-serving` 单列一条 well-lit path 就是这个道理。**而且判断标准只能是 `request_cached_tokens` 指标，不能靠读配置。**
 
 ## 10. 速查
 
@@ -969,7 +1018,7 @@ pkg/kvcache/prefix_match.go:46-58            PodMatch（tier 加权）
 |----|------|------|
 | **漏 `prefixMatchInfoProducerName`** | 以为用精确，实际跑近似，**无报错** | scorer 参数必须指向 producer 实例名（§5.3） |
 | 用 `precise-prefix-cache-scorer` | 启动日志有 DEPRECATION | 改成 producer + `prefix-cache-scorer` |
-| 共享前缀短于 block size | 命中率 0 | 前缀必须填满完整 block（§9） |
+| 共享前缀短于 block size | 命中率 0 | 前缀必须填满完整 block（§9.2 有反例推演） |
 | 近似路线 + 短前缀（<64 token） | 命中率 0 | 换精确路线 |
 | **Sliding window / Mamba 模型** | 事件被静默跳过，配了没用 | 换模型或放弃前缀路由（§8.3） |
 | 未配 `replaySocketPort` | EPP 重启后索引空，慢慢重建 | 配上，且确认 vLLM 侧开了 ROUTER socket |

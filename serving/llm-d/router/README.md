@@ -38,7 +38,7 @@ Router 的全部代码在 `llm-d/llm-d-router` 一个仓库里，产出三个二
 
 ## 版本与复现
 
-本系列按 **`main` 分支**分析，固定到核对时的提交 `90a28bc66f1d96f84f8f18f11dcd6ed15f34e830`（2026-09-07）。基线 `go.mod` 为 **Go 1.26.6**，`pkg/` + `cmd/` 非测试 Go 源码 **78742 行**。
+本系列按 **`main` 分支**分析，固定到核对时的提交 `90a28bc66f1d96f84f8f18f11dcd6ed15f34e830`（2026-09-07）。基线 `go.mod` 为 **Go 1.26.6**，`pkg/` + `cmd/` + `internal/` 非测试 Go 源码 **78923 行**（统计口径与逐目录分布见 [00 篇 §3](00-总览与架构.md#3-代码地图)，全系列以该口径为准）。
 
 `main` 会前移，本系列的行号引用会逐渐漂移。逐行复现时请检出固定提交：
 
@@ -61,18 +61,19 @@ git rev-parse HEAD       # 应为 90a28bc66f1d96f84f8f18f11dcd6ed15f34e830
 | `pkg/kvcache` | 3621 | KV 块索引：`kvblock.Index`、TokenProcessor、Redis/内存后端 | 04 |
 | `pkg/kvevents` | 2642 | ZMQ 事件摄取、分片 Pool、replay | 04 |
 | `pkg/common` | 1863 | 错误类型（429/503 的语义就在这里）、日志、配置 | 01 §3 |
-| `cmd` | 1952 | `epp` / `pd-sidecar` / `coordinator` 三个入口 | 01 §1 |
+| `cmd` | 1952 | `epp` / `pd-sidecar` / `coordinator` 三个入口 | 01 §1 · 02 §2.5 |
 
 ## 学习路线
 
-沿用统一示例贯穿全篇：
+沿用统一示例贯穿全篇（完整定义与设计理由见 [00 篇 §2](00-总览与架构.md#2-统一示例贯穿-0007-篇)）：
 
 ```
 集群：P/D 分离部署，命名空间 llm-d
-  prefill pods:  P1, P2      label llm-d.ai/role=prefill
-  decode  pods:  D1, D2, D3  label llm-d.ai/role=decode（含 pd-sidecar）
-请求 A：系统提示 S（2000 token）+ 问题 QA（50 token）
-请求 B：同一个系统提示 S + 问题 QB（50 token）   ← 与 A 共享 2000 token 前缀
+  prefill pods:  P1, P2        label llm-d.ai/role=prefill
+  decode  pods:  D1..D4        label llm-d.ai/role=decode（各含 pd-sidecar）
+系统提示 S：2048 token，A/B 完全相同
+请求 A：S + 问题 QA（40 token）
+请求 B：S + 问题 QB（24 token）   ← 与 A 共享 2048 token 前缀
 追问：A 走完之后，B 应该去哪？为什么？
 ```
 
@@ -85,66 +86,26 @@ git rev-parse HEAD       # 应为 90a28bc66f1d96f84f8f18f11dcd6ed15f34e830
 | [04](04-核心代码分析-KVCache索引与前缀缓存路由.md) | **KV 索引与前缀缓存路由** | 近似（EPP 路由历史）vs 精确（vLLM 真实 KV 事件）；ZMQ 事件摄取与**按 pod 分片保序**；`kvblock.Index` 结构；**EPP 的 block key 不需要与 vLLM 内部 hash 一致**（只要自己前后一致）；`MatchBlockKeys`/`ScoreTokens` 的分层加权；**坑：64 token 硬下限、`prefixMatchInfoProducerName` 漏配则静默退化为近似**；replay 恢复 |
 | [05](05-核心代码分析-FlowControl流控与准入.md) | Flow Control 流控与准入 | **默认关闭**，要开 `flowControl` gate；单 `Processor` goroutine 的 actor 模型；`EnqueueAndWait` 阻塞直到派发或超时；**内部错误到 429/503 的精确映射**；`FlowKey`（FairnessID + Priority）与 priority band；公平性策略与排序策略；**`utilization-detector` 的 roofline 判据与 fail-closed 行为**（`stale_endpoints` 必须监控）；驱逐机制 |
 | [06](06-核心代码分析-PD分离与Sidecar.md) | **P/D 分离与 Sidecar** | sidecar 是**跑在 decode pod 里**的反向代理（不是 prefill）；`disaggregatedPrefillHandler` 的四路分支；NIXLv2 默认协议下 prefill 请求如何被改写（`max_tokens=1`）与 `kv_transfer_params` 如何协调；**6 种 KV connector 对照**（NIXLv2 / Shared Storage / SGLang / Mooncake / P2P / NIXL+P2P pull）；E/P/D 多模态扇出；chunked decode 与 data parallel；**sidecar vs Coordinator 的架构差异** |
-| [07](07-部署配方与排障.md) | **部署配方与排障** | 三个官方配方逐行讲（`optimized-baseline` / `pd-epp-config` / `epp-precise-prefix-cache-config`）；调优决策表；**完整 sizing 数据**（EPP 空闲 CPU 随 pod 数线性增长、内存随输出长度增长）；HA 三模式与 Active-Active 的状态分区问题；**20 条静默失效模式总表**；排障决策树；上线检查清单 |
+| [07](07-部署示例与端到端Demo.md) | **部署示例与端到端 Demo** | **一套 P/D 分离 + 精确前缀缓存全开的完整清单**（EPP 配置、prefill/decode Deployment、InferencePool 的端口拼法、RBAC）；**跑通统一示例的完整 demo**（发请求 A/B，逐条验证前缀命中与 PD decider）；**22 条静默失效模式总表** |
 
 **建议顺序**：00 → 01（这两篇建立框架，必读）→ 02（插件体系是理解其余各篇的钥匙）→ 按需读 03~06 → 07 落地。
 
-**只想解决具体问题**：直接跳 [07 篇 §7.2 的静默失效模式总表](07-部署配方与排障.md#72-静默失效模式总表)与 [§7.4 排障决策树](07-部署配方与排障.md#74-排障决策树)，每条都指回对应章节。
+**只想解决具体问题**：直接跳 [07 篇 §3 的静默失效模式总表](07-部署示例与端到端Demo.md#3-静默失效模式总表)，22 条每条都指回对应章节。
 
-## 四个影响代码走向的关键设计
+## 读之前先知道这四条
 
-### 1. 核心代码几乎不做决策，只编排插件
+这四条决定了整个代码库长什么样，正文在 [00 篇 §4](00-总览与架构.md#4-四个影响代码走向的关键设计)，这里只列结论，读到具体章节时会反复用到：
 
-EPP 的 `Scheduler` 本身不知道「怎么选 pod」。它只是按顺序调用 Filter → Scorer → Picker，**所有策略都在插件里**。这意味着：
-
-- **读源码要先读 YAML**。不知道配了哪些插件，读 `scheduler.go` 是读不出行为的。
-- **有 8 类扩展点**（02 篇 §1），远超「过滤 + 打分」的直觉。
-- **框架会自动注入缺失的组件**（Picker、Parser、Data Layer、DataProducer），配置里没写的东西可能仍然在跑（02 篇 §4）。
-
-### 2. 路由决策发生在请求体收完之后
-
-```go
-// pkg/epp/handlers/request.go:39-47（节选）
-	// an EoS in the request headers means this request has no body or trailers.
-	if req.RequestHeaders.EndOfStream {
-		// We will route this request to a random endpoint as this is assumed to just be a GET
-		return s.fallbackToRandomEndpoint(ctx, reqCtx, 0)
-	}
-```
-
-必须等到 body 收完才能决策——因为要分词、算前缀 hash、看模型名。**推论**：
-- 没有 body 的请求（GET 之类）**完全绕过调度器，随机选 pod**。
-- Router 必须缓冲请求体，这是 EPP 内存随并发与输出长度增长的根源（07 篇 §5.1）。
-
-### 3. 多 profile 时只有 Primary 决定 Envoy 的去向
-
-P/D 分离下调度器会跑两个 profile（prefill、decode），但 **ext-proc 只能回一个地址**。解法是：
-
-```
-Primary profile（decode）的结果 → Envoy 的目标 endpoint
-其余 profile（prefill）的结果   → 写进 HTTP header（x-prefiller-host-port）
-                                 → decode pod 里的 sidecar 读 header 去调 prefill
-```
-
-**这解释了为什么 P/D 需要 sidecar**：ext-proc 协议本身没有「一个请求发两个后端」的表达能力。
-
-### 4. 前缀路由的失败几乎都是静默的
-
-这是本系列反复强调的一条。前缀缓存配错时**不会报错、不会降级告警，只是命中率变成 0**：
-
-| 配错什么 | 表现 |
-|---------|------|
-| 漏 `prefixMatchInfoProducerName` | 以为在用精确索引，实际是近似的 |
-| 漏 `dataLayer` 里的 endpoint-notification wiring | 精确索引从未订阅任何 pod，永远空 |
-| `token-producer` 的 `modelName` 配错 | hash 全不匹配 |
-| 共享前缀短于 block size | 一个块都凑不满 |
-| Active-Active 多副本 + 近似索引 | 各副本状态分区，命中率腰斩 |
-
-**唯一可靠的验证手段是看 `request_cached_tokens` 指标**，不能只检查配置文件（07 篇 §8.4）。
+| # | 设计 | 一句话后果 |
+|---|------|-----------|
+| 1 | **一切皆插件，核心只编排** | 读核心代码看不出任何行为，必须配着 `EndpointPickerConfig` YAML 看；排障第一步是 dump 生效配置 |
+| 2 | **决策在 RequestBody EoS 之后才发出** | 没有 body 的请求（GET 类）**完全绕过调度器，随机选 pod**；EPP 必须缓冲请求体，这是它内存增长的根源 |
+| 3 | **只有 Primary Profile 决定 Envoy 的去向** | ext-proc 只能回一个地址，所以 prefill 地址只能走 HTTP header——**这就是 P/D 必须有 sidecar 的原因** |
+| 4 | **前缀路由的失败几乎全是静默的** | 配错不报错、不告警，只是命中率变 0。**唯一可靠的验证手段是 `request_cached_tokens` 指标**，不能只检查配置文件 |
 
 ## 最容易踩的配置坑
 
-完整的 20 条在 [07 篇 §7.2](07-部署配方与排障.md#72-静默失效模式总表)，这里列最高频的 6 条：
+完整的 22 条在 [07 篇 §3](07-部署示例与端到端Demo.md#3-静默失效模式总表)，这里列最高频的 6 条：
 
 | 坑 | 症状 | 修法 |
 |----|------|------|
@@ -174,20 +135,7 @@ kubectl exec deploy/epp -- curl -s localhost:9090/metrics | grep -E \
 
 **`stale_endpoints > 0` 是 Flow Control 停摆的唯一前兆**：饱和检测器是 fail-closed 的，指标过期时它判定「饱和」，于是整池拒绝新请求——一个采集故障会放大成全池不可用（05 篇 §6.4）。
 
-## 阅读源码的三个提示
-
-1. **先看 `deploy/config/` 再看 `pkg/epp`**。那里有 19 个现成的 EPP 配置示例，是理解「这套插件体系实际怎么搭」最快的入口。挑一个（比如 `pd-epp-config.yaml`，只有 37 行）对着 02 篇读。
-
-2. **注释里有大量「当前实现的偏差」说明**。这个仓库的注释经常在主动交代设计取舍与已知问题，比如 `admission.go` 里那段解释 429/503 语义的注释、`request.go` 里承认「无 body 的请求会随机路由」并挂了对应 PR 链接。这些是排障的第一手线索。
-
-3. **`docs/` 与代码不一致时以代码为准，但 `docs/operations.md` 例外**——它是压测得出的 sizing 数据，代码里没有等价信息，是唯一来源（07 篇 §5 全部引自它）。
-
-```bash
-cd sources/llm-d-router
-ls deploy/config/                                           # 19 个 EndpointPickerConfig 示例
-rg -n 'Type\(\) string' pkg/epp/framework/plugins --no-heading | wc -l   # 内置插件数量
-rg -n 'featuregate' pkg/epp --no-heading -l                 # feature gate 的定义与使用点
-```
+读源码时的三个入手点（先看 `deploy/config/` 而不是 `pkg/epp`、注释里有大量「当前实现的偏差」说明、`docs/` 与代码冲突时以代码为准但 `docs/operations.md` 例外）见 [00 篇 §8.3](00-总览与架构.md#8-速查)。
 
 ---
 

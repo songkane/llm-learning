@@ -852,6 +852,8 @@ T+8s  后端消化，队列降到 5，KV 到 0.60
   → Director 继续第 ⑦ 步 Locate → ... → 选中 D2
 ```
 
+**这里选中的是 D2 而不是 02 篇 §3.4 里的 D3**，因为等了 8 秒之后各 pod 的负载状态已经完全变了——这正好说明 01 篇 §3 那条"准入跑在定位候选之前"的顺序含义：**排队期间的池子状态变化不属于准入的判断依据，调度是在放行之后才用新快照重跑的。**
+
 **如果 30s 内 saturation 一直 ≥ 1.0**：sweep 发现超 TTL → `Finalize(ErrTTLExpired)` → `translateFlowControlError` 探测 `poolEmpty()`：
 
 - 池里有 pod（本例）→ **429** + `RequestDroppedReasonTTLExpired`
