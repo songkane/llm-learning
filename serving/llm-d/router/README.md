@@ -86,11 +86,11 @@ git rev-parse HEAD       # 应为 90a28bc66f1d96f84f8f18f11dcd6ed15f34e830
 | [04](04-核心代码分析-KVCache索引与前缀缓存路由.md) | **KV 索引与前缀缓存路由** | 近似（EPP 路由历史）vs 精确（vLLM 真实 KV 事件）；ZMQ 事件摄取与**按 pod 分片保序**；`kvblock.Index` 结构；**EPP 的 block key 不需要与 vLLM 内部 hash 一致**（只要自己前后一致）；`MatchBlockKeys`/`ScoreTokens` 的分层加权；**坑：64 token 硬下限、`prefixMatchInfoProducerName` 漏配则静默退化为近似**；replay 恢复 |
 | [05](05-核心代码分析-FlowControl流控与准入.md) | Flow Control 流控与准入 | **默认关闭**，要开 `flowControl` gate；单 `Processor` goroutine 的 actor 模型；`EnqueueAndWait` 阻塞直到派发或超时；**内部错误到 429/503 的精确映射**；`FlowKey`（FairnessID + Priority）与 priority band；公平性策略与排序策略；**`utilization-detector` 的 roofline 判据与 fail-closed 行为**（`stale_endpoints` 必须监控）；驱逐机制 |
 | [06](06-核心代码分析-PD分离与Sidecar.md) | **P/D 分离与 Sidecar** | sidecar 是**跑在 decode pod 里**的反向代理（不是 prefill）；`disaggregatedPrefillHandler` 的四路分支；NIXLv2 默认协议下 prefill 请求如何被改写（`max_tokens=1`）与 `kv_transfer_params` 如何协调；**6 种 KV connector 对照**（NIXLv2 / Shared Storage / SGLang / Mooncake / P2P / NIXL+P2P pull）；E/P/D 多模态扇出；chunked decode 与 data parallel；**sidecar vs Coordinator 的架构差异** |
-| [07](07-部署示例与端到端Demo.md) | **部署示例与端到端 Demo** | **一套 P/D 分离 + 精确前缀缓存全开的完整清单**（EPP 配置、prefill/decode Deployment、InferencePool 的端口拼法、RBAC）；**跑通统一示例的完整 demo**（发请求 A/B，逐条验证前缀命中与 PD decider）；**22 条静默失效模式总表** |
+| [07](07-部署示例与端到端Demo.md) | **部署示例与端到端 Demo** | **一套 P/D 分离 + 精确前缀缓存全开的完整清单**（EPP 配置、prefill/decode Deployment、InferencePool 的端口拼法、RBAC）；**跑通统一示例的完整 demo**（发请求 A/B，逐条验证前缀命中与 PD decider）；**24 条静默失效模式总表** |
 
 **建议顺序**：00 → 01（这两篇建立框架，必读）→ 02（插件体系是理解其余各篇的钥匙）→ 按需读 03~06 → 07 落地。
 
-**只想解决具体问题**：直接跳 [07 篇 §3 的静默失效模式总表](07-部署示例与端到端Demo.md#3-静默失效模式总表)，22 条每条都指回对应章节。
+**只想解决具体问题**：直接跳 [07 篇 §3 的静默失效模式总表](07-部署示例与端到端Demo.md#3-静默失效模式总表)，24 条每条都指回对应章节。
 
 ## 读之前先知道这四条
 
@@ -105,7 +105,7 @@ git rev-parse HEAD       # 应为 90a28bc66f1d96f84f8f18f11dcd6ed15f34e830
 
 ## 最容易踩的配置坑
 
-完整的 22 条在 [07 篇 §3](07-部署示例与端到端Demo.md#3-静默失效模式总表)，这里列最高频的 6 条：
+完整的 24 条在 [07 篇 §3](07-部署示例与端到端Demo.md#3-静默失效模式总表)，这里列最高频的 6 条：
 
 | 坑 | 症状 | 修法 |
 |----|------|------|

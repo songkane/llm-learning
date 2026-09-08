@@ -12,7 +12,7 @@
 | 两个 scheduling profile | 02 §6 | `disagg-profile-handler` + `prefill`/`decode` 两条链 |
 | 精确 KV 索引与 ZMQ 事件 | 04 §1 | `precise-prefix-cache-producer` + vLLM 的 `--kv-events-config` |
 | Data Layer 手写 wiring | 03 §1 | 显式的 `dataLayer` 段 |
-| sidecar 两阶段调用 | 06 §2 | decode pod 里的 `pd-sidecar` |
+| sidecar 两阶段调用 | 06 §2 | decode pod 里的 `routing-sidecar` 容器 |
 | PD decider | 02 §5.4 | `prefix-based-pd-decider`，决定"这个请求值不值得分离" |
 
 > **关于这份配置的来源**：上游把 P/D（`deploy/config/pd-epp-config.yaml`）和精确前缀缓存（`deploy/config/epp-precise-prefix-cache-config.yaml`）做成了**两个独立的示例文件**，本篇是把它们合成一份并补齐 K8s 侧清单，属于教学用的组合，不是上游某个文件的原文。真实部署请对照 `deploy/environments/dev/p-d/` 的 kustomize overlay。
@@ -34,7 +34,7 @@
                     ▼
         ┌───────────────────────────┐        ┌──────────────────────┐
         │ decode pod (D1..D4)       │        │ prefill pod (P1..P2) │
-        │  pd-sidecar   :8000  ◄────┼─Envoy  │  vLLM      :8000     │
+        │ routing-sidecar :8000 ◄───┼─Envoy  │  vLLM      :8000     │
         │       │ localhost         │        │  ZMQ pub   :5557     │
         │       ▼                   │        │  ZMQ replay:5558     │
         │  vLLM         :8200       │───────►│  （无 sidecar）       │
@@ -48,7 +48,7 @@
 | **8000** | decode pod 的 **sidecar**；prefill pod 的 **vLLM** | Envoy（只打 decode）、EPP（抓 `/metrics`）、sidecar（直连 prefill，不过 Envoy） |
 | 8200 | decode pod 的 vLLM | 只有本 pod 的 sidecar，走 `localhost` |
 | 8001-8007 / 8201-8207 | DP rank r 的 sidecar / vLLM | `sidecar 8000+r → vLLM 8200+r` |
-| 5557 / 5558 | 两种 pod 的 vLLM | EPP 的 ZMQ 订阅 / replay |
+| 5557 / 5558 | 两种 pod 的 vLLM（**引擎侧 bind**） | EPP 拨入订阅 / 请求 replay，方向见 §1.4 |
 | 9002 / 9003 / 9090 | EPP | Envoy 的 ext-proc / gRPC 健康检查 / Prometheus |
 
 **8000 这个统一端口是整套设计的枢纽**，它同时解决了三个问题：
@@ -108,6 +108,8 @@ plugins:
   - type: prefix-based-pd-decider
     parameters:
       nonCachedTokens: 512              # 上游示例是 16，见下面「四个必须改的值」
+      # 和 scorer 一样必须显式指向精确 producer，否则 decider 读的是近似数据
+      prefixMatchInfoProducerName: precise-prefix-cache-producer
 
 dataLayer:
   sources:
@@ -153,6 +155,8 @@ schedulingProfiles:
 **三处最容易漏的连带影响**：
 
 1. **`prefixMatchInfoProducerName` 漏了** → 框架自动补一个**近似** producer，你以为在用精确索引，没有任何报错（04 §5.3）。
+
+   **注意这个参数有两个地方要写**：`prefix-cache-scorer` 和 `prefix-based-pd-decider` **各有一份**，而且两者的默认值都是"近似 producer"（`prefix_based_pd_decider.go:37-39` 的注释原文：*Empty defaults to the approximate-prefix producer*）。decider 把这个 key 声明成 `Consumes().Required`（`:149-156`），所以漏配不会启动失败——框架会按 `DefaultProducerRegistry` 静默补一个 `approx-prefix-cache-producer`，于是你得到**两个 producer 并存**：scorer 按 block size 16 打分，decider 按 block size 64 判断该不该分离。两套数据、两个粒度，全程无报错。
 2. **`dataLayer` 段漏了 `endpoint-notification-source` → `precise-prefix-cache-producer` 这条 wiring** → producer 在、scorer 绑定也对，但**从来没订阅任何 pod**，索引永远是空的（04 §1.5）。
 3. **`metrics-data-source` + `core-metrics-extractor` 这里是显式列出的，但机制是"叠加注入"而不是"要么全给要么全没"**。`ensureDataLayer`（`defaults.go:307-329`）只在两种情况下不注入：配了 `dataLayer.injectDefaults: false`，或者你的 `dataLayer.sources` 里**已经有一个 `metrics-data-source`**（`hasSourceOfType`，`defaults.go:339-346`）。其余情况它会把默认的 source + extractor **追加**进你手写的 `dataLayer` 里。所以只写 notification 那一条不会丢掉指标采集——我这里写全是为了让配置自解释、以及把 extractor 的绑定关系摆在明面上。
 
@@ -285,9 +289,10 @@ spec:
   type: ClusterIP
   ports:
     - { name: default, port: 9002, targetPort: 9002, appProtocol: http2 }   # ext-proc
-    - { name: zmq,     port: 5557, targetPort: 5557, appProtocol: tcp }
     - { name: metrics, port: 9090, targetPort: 9090 }
 ```
+
+**这里刻意没有 5557**，尽管上游的 EPP Service 有。原因见下面 §1.4——KV 事件有两种互斥的传输拓扑，本示例用的那种不需要 EPP 监听端口。
 
 **EPP Deployment + RBAC**（EPP 只读，不需要任何写权限）：
 
@@ -321,7 +326,6 @@ spec:
             - { containerPort: 9002, name: grpc }
             - { containerPort: 9003, name: grpc-health }
             - { containerPort: 9090, name: metrics }
-            - { containerPort: 5557, name: zmq }
           readinessProbe:                        # 注意是 gRPC 探针，不是 HTTP
             grpc:
               port: 9003
@@ -393,7 +397,7 @@ spec:
         request: 30s
 ```
 
-**升级期的一个坑**：`inference.networking.x-k8s.io` 与 `inference.networking.k8s.io` 两个 CRD 组可以共存，上面的 ClusterRole 也把两个都授权了。但 EPP 的行为是**只读新组、完全忽略 legacy 组**：
+**升级期的一个坑**：`inference.networking.x-k8s.io` 与 `inference.networking.k8s.io` 两个 CRD 组可以共存，上面的 Role 也把两个都授权了。但 EPP 的行为是**只读新组、完全忽略 legacy 组**：
 
 ```go
 // pkg/epp/server/controller_config.go:78, 85（节选）
@@ -405,6 +409,26 @@ spec:
 **多副本的提示**：`replicas: 1` 是刻意的。EPP 跑多副本时，**近似前缀索引不共享**、Flow Control 的容量上限要乘副本数，而本篇用的是精确索引，所以要 HA 就得把 `indexerConfig` 换成 Redis 后端，并保证所有副本的 `hashSeed` / `hashAlgorithm` 一致（04 §4.3）。上游 `docs/operations.md` 的原话：
 
 > **Active-Active mode should be avoided when using approximate prefix routing.** Because EPP replicas do not share prefix state, each replica only has visibility into the prefix state of the requests it has individually handled.
+
+### 1.4 KV 事件有两种互斥的传输拓扑，别混
+
+这是配精确前缀缓存时最容易搞错的一处，因为**两种模式的 ZMQ 连接方向是相反的**，而配置项长得毫不相干。分叉点在 `producer.go:173-178`：只要 `kvEventsConfig.zmqEndpoint` 非空就走模式 A，否则靠 `podDiscoveryConfig` 走模式 B。
+
+| | 模式 A：全局 socket | 模式 B：逐 pod 发现（**本示例用的**） |
+|---|---|---|
+| 谁监听、谁连接 | **EPP 监听**，引擎主动连上来 | **引擎监听**，EPP 逐个拨过去 |
+| EPP 侧配置 | `kvEventsConfig.zmqEndpoint: tcp://0.0.0.0:5557` | 留空 `zmqEndpoint`，配 `podDiscoveryConfig.socketPort` |
+| 引擎侧配置 | 指向 EPP 的 Service，如 `--zmq-endpoint=tcp://<epp-svc>:5557` | 在本 pod 上 bind，如 `tcp://*:5557` |
+| EPP 要不要暴露 5557 | **要**（Service + containerPort） | **不要** |
+| 代码路径 | `EnsureSubscriber(..., "local-subscriber", ..., remoteSocket=false)` → `sub.Listen()` | `Extract` → `ensureSubscriber` → `sub.Dial()` |
+| 支持 replay 吗 | **不支持**（那次调用的 `replayEndpoint` 传的是空串） | 支持，靠 `replaySocketPort` |
+| DP 多 rank | 共用一个 socket | 端口按 rank 偏移：`socketPort + rankIndex` |
+
+同一个 `zmqSubscriber` 同时实现了两种：`zmq_subscriber.go:129-144` 按 `remote` 标志决定是 `Listen`（bind）还是 `Dial`（connect）。
+
+**为什么要专门说这件事**：上游 `deploy/` 里的 EPP Service 和 Deployment 都暴露了 5557，因为它的 dev 环境走的是**模式 A**——`deploy/components/overlays/simulator/` 给引擎加的是 `--zmq-endpoint=tcp://${EPP_NAME}.${NAMESPACE}.svc.cluster.local:5557`。如果你照抄那份 Service，却按本示例配了 `podDiscoveryConfig`，就会得到一个**没人连的空监听端口**，同时真正的订阅走的是另一条路。功能上不致命，但会让排障时的端口检查完全误导人。
+
+**选哪个**：要 replay 恢复能力（EPP 重启后不用慢慢重建索引）就只能用模式 B；只是想快速验证、或者引擎侧不方便暴露端口，模式 A 更省事。
 
 ## 2. 端到端 Demo
 
@@ -482,7 +506,7 @@ sidecar: 读 x-prefiller-host-port → 调 P:8000（max_tokens=1）
 kubectl -n $NS exec deploy/llama-8b-prefill -- curl -s localhost:8000/metrics | grep num_requests_running
 
 # ② sidecar 确认进了 P/D 分支，且没有抱怨缺 kv_transfer_params
-kubectl -n $NS logs deploy/llama-8b-decode -c pd-sidecar | grep -E 'using P/D protocol|missing'
+kubectl -n $NS logs deploy/llama-8b-decode -c routing-sidecar | grep -E 'using P/D protocol|missing'
 #    期望：看到 "using P/D protocol"，看不到 "missing 'kv_transfer_params'"
 #    看到 missing → vLLM 没启用 KV connector，P/D 白配，decode 自己重算了 prefill
 
@@ -528,7 +552,7 @@ kubectl -n $NS logs deploy/llama-8b-epp | grep 'Calculated score'   # 需 -v=4
 
 # ③ B 没有走 prefill：prefill pod 的计数应该还是 A 那一次，没有增加
 kubectl -n $NS exec deploy/llama-8b-prefill -- curl -s localhost:8000/metrics | grep num_requests_total
-kubectl -n $NS logs deploy/llama-8b-decode -c pd-sidecar | grep 'skip disaggregated prefill'
+kubectl -n $NS logs deploy/llama-8b-decode -c routing-sidecar | grep 'skip disaggregated prefill'
 ```
 
 第 ③ 条是这个 demo 最有意思的地方：**前缀缓存命中反过来让 P/D 分离变得不必要了**。B 的 2048 token 已经在本地 decode pod 的 KV 里，只有 24 个 token 需要 prefill，本地算比跨节点搬运更快，于是 decider 走了 06 篇 §2 的分支 ④，sidecar 退化成透明代理。**这两个机制不是各自独立的，它们会互相影响** —— 把 `nonCachedTokens` 改回上游的 16，B 就又会去走 prefill 了，可以改一下 ConfigMap 重启 EPP 对比看。
@@ -574,6 +598,8 @@ kubectl -n $NS logs deploy/llama-8b-epp | grep -c 'Filter eliminated all endpoin
 | 20 | **无 body 的请求** | 完全绕过调度，随机选 pod | `request.go:44-47` | 01 §7 |
 | 21 | **DP 场景漏 `llm-d.ai/active-ports` annotation** | 所有 rank 都被当成活跃，滚动启动期打到没就绪的 rank | `ready_endpoints` 与实际就绪 rank 数不符 | 03 §5 |
 | 22 | **sidecar 的 `restartPolicy: Always` 漏了** | 它退化成普通 init 容器，跑完就退出 | pod 起不来或 8000 无人监听 | 07 §1.3 |
+| 23 | **`prefix-based-pd-decider` 漏 `prefixMatchInfoProducerName`** | decider 读近似数据、scorer 读精确数据，两个粒度并存 | 看有没有多出一个 `approx-prefix-cache-producer` | 07 §1.2 |
+| 24 | **ZMQ 两种拓扑混配** | EPP 上一个没人连的 5557 空监听，真正订阅走另一条路 | `zmqEndpoint` 与 `podDiscoveryConfig` 只该配一个 | 07 §1.4 |
 
 **与之相对的好消息**：下面这些是**启动期硬失败**，配错了 EPP 根本起不来，不用担心它们静默生效——`--pool-name` 与 `--endpoint-selector` 都给或都不给、插件参数有未知字段、`pluginRef` 指向不存在的插件、配了两个或零个 ProfileHandler、多 profile 用了 `single-profile-handler`、Alpha 插件没加 `--allow-experimental-plugins`、未知的 feature gate 名。
 
