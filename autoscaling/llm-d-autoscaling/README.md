@@ -171,3 +171,8 @@ git log --oneline v0.8.0..d5d5864 -- internal/engines/analyzers/saturation_v2
 git diff v0.8.0..d5d5864 -- deploy/configmap-saturation-scaling.yaml
 git log --oneline -- internal/engines/pipeline/rescale.go
 ```
+
+---
+
+> **相关系列**：[llm-d Router](../../scheduling/llm-d/)（决定请求发给哪个副本）｜ [kube-scheduler](../../scheduling/kube-scheduler/) / [Volcano](../../scheduling/volcano/)（决定 Pod 落在哪个节点）
+> **回到** [弹性扩缩容总览](../README.md)

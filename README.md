@@ -10,7 +10,8 @@
 |------|------|------|
 | 推理引擎 | [`inference-engine/`](inference-engine/) | 大模型推理引擎的架构与源码剖析（vLLM、SGLang） |
 | KV Cache 基础设施 | [`kvcache/`](kvcache/) | KV Cache 的跨实例共享与跨节点传输（Mooncake） |
-| 调度与编排 | [`scheduling/`](scheduling/) | 训练/推理作业的资源调度、编排与自动扩缩容（kube-scheduler、Volcano、Kueue、llm-d WVA） |
+| 调度与编排 | [`scheduling/`](scheduling/) | 训练/推理作业的资源调度、编排与请求路由（kube-scheduler、Volcano、Kueue、llm-d Router） |
+| 弹性扩缩容 | [`autoscaling/`](autoscaling/) | 推理服务「该开几个副本」的决策（llm-d WVA） |
 
 > 更多分类（训练、MaaS 平台、Agent、RAG 等）将持续补充。
 
@@ -38,7 +39,7 @@
 
 ### 调度与编排
 
-聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」，以及「推理服务到底该开几个副本」。
+聚焦「一堆 GPU、一堆队列、一堆作业，怎么在 Kubernetes 上被公平且高效地分配」，以及「一个推理请求该发给哪个副本」。
 
 - [**kube-scheduler 源码学习**](scheduling/kube-scheduler/) —— K8s 原生调度器，一切的地基：调度框架 15 个扩展点、三队列与 QueueingHint、增量快照与 assume、过滤采样与打分归一化、抢占六轮打分、DRA，以及 **v1.36 新引入的原生 gang 调度与拓扑感知 Placement**（Alpha）。另附两篇扩展实战：**自建插件**（Framework Plugin，每个扩展点一个可编译 demo）与**免编译扩展**（Extender / SchedulingGates / Webhook / DRA，用官方镜像零编译）。
 
@@ -48,9 +49,19 @@
 
 > 一句话区分上面三者：**Kueue 决定「作业什么时候可以开始」，kube-scheduler 与 Volcano 决定「Pod 落到哪个节点」**（后两者按 `schedulerName` 分流、互斥）。建议先读 kube-scheduler 的 00~01 建立地基，再看另两个补了什么缺口。详见 [scheduling/README](scheduling/README.md)。
 
-另有一套**自动扩缩容**的笔记，问题域不同（不管 Pod 放哪，只管该有几个 Pod），可独立阅读：
+另有一套 **llm-d 推理请求路由**的笔记，问题域与上面三者不同（不管 Pod 放哪），可独立阅读。
 
-- [**llm-d WVA 源码学习**](scheduling/llm-d-autoscaling/) —— llm-d 的 Workload Variant Autoscaler，工作在 scale 层，产出 `wva_desired_replicas` 指标供 HPA/KEDA 消费。带 LLM 语义的容量模型：**token 供需双阈值**（`RC = max(0, demand/0.85 − anticipated)` / `SC = max(0, supply − demand/0.70)`，0.70~0.85 是结构性死区）、**异构机型成本优化**（同模型多变体按 `cost/每副本容量` 择优）、**P/D 分离联合扩容**（Δ_util 匹配，避免单侧超扩）、**多 analyzer 投票与容量来源选择**（saturation / throughput、`T-sfz` 历史容量复用；QM 排队论实现当前禁用）、**缩容到零与 100ms 冷启动唤醒**。附一份[计算逻辑可视化速查（HTML）](scheduling/llm-d-autoscaling/wva-autoscaling-logic.html)。
+- [**llm-d Router 源码学习**](scheduling/llm-d/) —— llm-d 的推理请求路由器（Endpoint Picker），工作在 request 层，以 Envoy **ext-proc** 形式给出每个请求的目标 pod。与传统 L7 LB 的区别在于它懂 LLM 的成本结构（**KV Cache 让后端强状态化**）：**插件化的调度框架**（8 类扩展点、Filter/Scorer/Picker 三段式、加权求和不归一化）、**Data Layer 指标采集**（每 endpoint 一个 goroutine、每 50ms 抓一次，按 `engine-type` 适配 vLLM/SGLang 的指标名差异）、**KV 前缀缓存亲和路由**（近似的路由历史 vs 精确的 vLLM ZMQ 事件流，`kvblock.Index` 与分片保序）、**Flow Control 多租户流控**（actor 模型、FlowKey 公平性、429/503 的精确语义、fail-closed 的饱和检测）、**P/D 分离编排**（sidecar 跑在 decode pod 里、6 种 KV connector 对照、E/P/D 多模态扇出）。末篇附**三个官方配方逐行讲 + 完整 sizing 数据 + 20 条静默失效模式总表**。
+
+> 注意术语变迁：`llm-d-router` 原名 `llm-d-inference-scheduler`，且 KV Indexer（原 `llm-d-kv-cache`）与 P/D sidecar（原 `llm-d-routing-sidecar`）都已合并进这个仓库 —— **大量现存资料已过时**，判断信号见 [该系列 README](scheduling/llm-d/README.md#术语变迁看外部资料前必读)。
+
+### 弹性扩缩容
+
+聚焦「推理服务到底该开几个副本、加在哪个机型上」—— 与调度是两个问题域：**扩缩容改 `spec.replicas`，调度写 `pod.spec.nodeName`**，后者只在副本数定了之后才开始工作。
+
+- [**llm-d WVA 源码学习**](autoscaling/llm-d-autoscaling/) —— llm-d 的 Workload Variant Autoscaler，工作在 scale 层，产出 `wva_desired_replicas` 指标供 HPA/KEDA 消费。带 LLM 语义的容量模型：**token 供需双阈值**（`RC = max(0, demand/0.85 − anticipated)` / `SC = max(0, supply − demand/0.70)`，0.70~0.85 是结构性死区）、**异构机型成本优化**（同模型多变体按 `cost/每副本容量` 择优）、**P/D 分离联合扩容**（Δ_util 匹配，避免单侧超扩）、**多 analyzer 投票与容量来源选择**（saturation / throughput、`T-sfz` 历史容量复用；QM 排队论实现当前禁用）、**缩容到零与 100ms 冷启动唤醒**。附一份[计算逻辑可视化速查（HTML）](autoscaling/llm-d-autoscaling/wva-autoscaling-logic.html)。
+
+> WVA 与上面的 Router 同属 llm-d 项目，但问题域不同：**WVA 决定「该有几个副本」，Router 决定「这个请求发给哪个副本」**。两者互不依赖，建议先读 Router —— WVA 的容量模型建立在对 KV token 供需的理解上，读过 Router 的 Data Layer（03 篇）会更顺。详见 [autoscaling/README](autoscaling/README.md)。
 
 ## 本地源码对照（`sources/`）
 
@@ -71,12 +82,15 @@
 | Volcano | `sources/volcano` | `v1.15.1` | 6620 | 152M |
 | Kueue | `sources/kueue` | `v0.19.1` | 6987 | 267M |
 | llm-d WVA | `sources/llm-d-autoscaling` | `release-0.9 @ d5d5864` | 1840 | 22M |
+| llm-d Router | `sources/llm-d-router` | `main @ 90a28bc` | 2872 | 30M |
 
 合计约 2.9G。
 
-> WVA 使用 `release-0.9`（核对提交 `d5d5864`），与 `v0.9.0` tag 不同；详见 [版本对照](scheduling/llm-d-autoscaling/README.md#版本对照与复现)。
+> WVA 使用 `release-0.9`（核对提交 `d5d5864`），与 `v0.9.0` tag 不同；详见 [版本对照](autoscaling/llm-d-autoscaling/README.md#版本对照与复现)。
 >
-> `llm-d-autoscaling` 是仓库改名后的新名字（原 `llm-d-workload-variant-autoscaler`），`go.mod` 的 module 路径仍是老名字。
+> Router 使用 `main`（核对提交 `90a28bc`）而非 tag：`v0.9.0` 的 `pkg/` 下还没有 `kvcache` 与 `coordinator`（KV Indexer 与 Coordinator 的迁入都在 tag 之后），用它会让 KV 索引与 Coordinator 两篇无从谈起；详见 [版本对照](scheduling/llm-d/README.md#版本对照与复现)。
+>
+> 两个 llm-d 仓库都改过名：`llm-d-autoscaling` 原名 `llm-d-workload-variant-autoscaler`（`go.mod` 的 module 路径仍是老名字），`llm-d-router` 原名 `llm-d-inference-scheduler`。
 
 **脚本只管「有没有」，不管「是哪个版本」**：已存在的仓库一律跳过，不做 `fetch`/`checkout`/`reset`；
 缺失的用标准 `git clone` 拉全（完整历史 + 全部 tag + 全部远端分支），并切到上表基线作为起点。
