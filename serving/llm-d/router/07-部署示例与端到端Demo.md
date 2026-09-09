@@ -692,7 +692,7 @@ kubectl -n $NS logs deploy/llama-8b-epp | grep -c 'Filter eliminated all endpoin
 | 3 | **`token-producer` 的 `modelName` 配错** | hash 全不匹配，命中率 0 | 与 vLLM 部署的模型名对比 | 04 §4.3 |
 | 4 | **共享前缀短于 block size** | 命中率 0 | 数一下系统提示 token 数 | 04 §9.2 |
 | 5 | **近似路线 + 前缀 < 64 token** | 同上（64 是硬下限） | 换精确路线 | 04 §4.2 |
-| 6 | **Sliding window / Mamba 模型** | KV 事件被静默跳过 | 模型架构 | 04 §8.3 |
+| 6 | **Sliding window / Mamba 模型** | KV 事件被跳过（纯 SWA 全失效、HMA 部分失效） | 看 `kv_cache_events_stores_skipped_total` 指标，**不是静默的** | 04 §8.3 |
 | 7 | **`llm-d.ai/engine-type` 没打 / 打错** | SGLang 按 vLLM 名解析 → 指标全失败 | `datalayer_extract_errors_total` | 03 §3.2 |
 | 8 | **自定义 engine mapping 只加一个字段** | 该 engine 的内置指标**全部丢失** | 必须重述整个 engineConfig | 03 §8.4 |
 | 9 | **DP 池的 `metrics-data-source` 设了 `port`** | 所有 rank 抓同一端口 | 别设 `port` | 02 §5.7 |
@@ -700,7 +700,7 @@ kubectl -n $NS logs deploy/llama-8b-epp | grep -c 'Filter eliminated all endpoin
 | 11 | **配了 `flowControl:` 忘开 gate** | 除 saturationDetector 外全忽略 | 启动日志的 Info 级 WARNING | 02 §7.3 |
 | 12 | **负 priority band 未 provision** | fallback 到 0，sheddable 失效 | 显式列出该 band | 05 §10 |
 | 13 | **vLLM 未启用 KV connector** | P/D 白配，decode 自己重算 | sidecar 日志 `missing 'kv_transfer_params'` | 06 §3.4 |
-| 14 | **`x-kv-cache-source-host-port` 格式错** | P2P pull 不生效，无任何日志 | `chat_completions.go:146-158` | 06 §4.4 |
+| 14 | **`x-kv-cache-source-host-port` 格式错 / SSRF 拒绝** | P2P pull 不生效（**有 Info 级日志**，别放弃看日志） | grep `ignoring malformed KV cache source header` 或 `KV cache source not in allowlist` | 06 §4.4 |
 | 15 | **encoder 全被 SSRF 过滤** | 退回 P/D 或纯 decode | 日志 `SSRF protection: all encoder targets filtered out` | 06 §5 |
 | 16 | **`utilization-filter` 未设 `fallbackOnEmpty`** | 尖峰时整池 429 | 生产建议开 | 02 §5.1 |
 | 17 | **插件 `Consumes()` 未声明就读数据** | 读取被静默丢弃，行为不对 | `plugin_data_scope_violations_total` | 01 §7 |

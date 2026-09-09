@@ -58,7 +58,7 @@ vLLM 在每个 pod 上开一个 **ZMQ PUB** socket，EPP 侧用 **SUB** 订阅�
 | 本地 / global | **Bind**（等连入） | 配置里的 `zmqEndpoint` |
 
 ```go
-// pkg/kvevents/zmq_subscriber.go:96-150（节选）
+// pkg/kvevents/zmq_subscriber.go:119-150（节选；Start 在 92-115）
 func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 	sub := zmq4.NewSub(ctx)
 	// Bind for local endpoints, connect for remote ones.
@@ -348,7 +348,7 @@ func NewIndex(ctx context.Context, cfg *IndexConfig) (Index, error) {
 |------|---------|---------|------|
 | `InMemoryIndex` | 双层 LRU（key 级 + 每 key 的 pod LRU） | 1e8 keys，每 key 10 pods | 单 EPP，默认 |
 | `CostAwareMemoryIndex` | Ristretto（按 cost 淘汰） | 2GiB | 内存需要硬上限时 |
-| `RedisIndex` | Redis 侧 TTL / 驱逐 | — | **多 EPP 副本共享**（HA 的唯一正解，见 03 篇 §8.5） |
+| `RedisIndex` | **没有任何 TTL**：只有 `ZAdd` / `HSet`，都不带过期（`redis.go:194,207`）。只能靠 `BlockRemoved` / `AllBlocksCleared` 显式删，或 Redis 服务端 `maxmemory-policy` 驱逐——**放任不管会无限增长** | — | **多 EPP 副本共享**（HA 的唯一正解，见 03 篇 §8.5） |
 
 ### 3.4 内存索引与最长前缀早停
 
@@ -362,10 +362,10 @@ type InMemoryIndex struct {
 }
 ```
 
-Lookup 只找**连续前缀**，一断就停：
+复用必须是**从头开始的连续前缀**，但这个语义**不在 `Index.Lookup` 里**。`InMemoryIndex.Lookup` 只在「key 命中但 PodCache 为空」这个退化情形提前返回；key **没找到**时只打一条 trace 日志、然后继续扫下一个 key（`in_memory.go:142-145`）：
 
 ```go
-// pkg/kvcache/kvblock/in_memory.go:122-127（节选）
+// pkg/kvcache/kvblock/in_memory.go:122-127（仅退化情形的 early return）
 	for idx, requestKey := range requestKeys {
 		if pods, found := m.data.Get(requestKey); found {
 			if pods == nil || pods.cache.Len() == 0 {
@@ -574,7 +574,7 @@ func foldCacheSalt(extraFeatures []*kvblock.BlockExtraFeatures, salt string, num
 
 ### 5.1 Indexer API
 
-`pkg/kvcache/indexer.go` 暴露三个方法：
+`kvcache.Indexer` 暴露三个方法（`ComputeBlockKeysFromTokens` 与 `ScoreTokens` 在 `indexer.go`，`MatchBlockKeys` 在同包的 `prefix_match.go:64-69`）：
 
 | 方法 | 作用 |
 |------|------|
@@ -671,7 +671,7 @@ scores[endpoint] += p.matchLengthWeight*matchLengthScore + (1.0-p.matchLengthWei
 | 分量 | 含义 | 何时更合适 |
 |------|------|-----------|
 | **match ratio** = `matchBlocks/totalBlocks` | 命中比例 | 默认（`matchLengthWeight=0`） |
-| **match length** | 命中的绝对长度（按 `matchLengthScaleTokens` 归一化） | 长短 prompt 混合时 |
+| **match length** | 命中的绝对长度，归一化后**再平方**：`(matchBlocks × blockSize / matchLengthScaleTokens)²`（`prefix/plugin.go:162-166`）。平方使它强烈偏向长命中；`matchLengthScaleTokens` 默认 **8192** | 长短 prompt 混合时 |
 
 **为什么需要 length 分量**：ratio 对短 prompt 有偏。一个 2-block 的 prompt 命中 1 个 block 得 0.5 分，一个 100-block 的 prompt 命中 40 个也只得 0.4 分——但后者省下的计算多 40 倍。混合负载下建议给 `matchLengthWeight` 一个非零值。
 
@@ -697,7 +697,7 @@ info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTok
 **两个后果**：
 
 1. 排序是对的（这是它的设计目的），但**别把这个数当 block 数报给别人**。真实 block 数用 `CachedBlockCount()`。
-2. `int()` 截断意味着「3 个 CPU tier block，每个权重 0.3」= `int(0.9)` = **0**，完全丢失信号。低 tier 命中在这里会被抹掉。
+2. `int()` 截断会抹掉低 tier 的短命中。出厂默认只有两档权重——`gpu: 1.0`、`cpu: 0.8`（`kvcache/backend.go:26-31` 的 `DefaultKVCacheBackendConfig`），所以真正归零的是**只命中 1 个 CPU block**：`int(1 × 0.8)` = **0**；命中 3 个则是 `int(2.4)` = 2，信号还在。每次截断都丢掉小数部分。顺带一提，§9.1 里 `matchBlocks` 能等于真实块数，正是因为 gpu 权重恰好是 1.0。
 
 ## 6. 近似 vs 精确：完整对照
 
@@ -828,7 +828,11 @@ func (p *Producer) PreRequest(...) error {
 
 **解决的问题**：从「EPP 决定发给 D3」到「vLLM 真的存好 block 并发出事件」之间有几十到几百毫秒的空窗。这期间进来的同前缀请求查不到 D3，会被路由到别处，然后**同一个前缀在多个 pod 上各算一遍**。
 
-**代价**：这些条目是预测，不是事实。请求可能失败、可能被引擎立刻淘汰。TTL（默认 2s）内它们会误导路由。真实事件到达后靠 dedup + Evict 收敛。
+**代价**：这些条目是预测，不是事实。请求可能失败、可能被引擎立刻淘汰。TTL（默认 2s）内它们会误导路由。
+
+**收敛机制容易想错**：预测条目**不是**被真实事件"转正"或覆盖的。`PodCache` 的 LRU 以整个 `PodEntry` 结构体为 key（`in_memory.go:216-220`），而 `PodEntry` 含 `DeviceTier` 与 `Speculative` 两个字段（`index.go:174-185`）——预测条目是 `{pod, DeviceTier:"", Speculative:true}`，引擎确认条目是 `{pod, DeviceTier:"gpu", Speculative:false}`，**两个不同的 key，会并存**。真正清掉预测条目的是 TTL 缓存的过期回调（`prerequest.go:91-103` 的 `OnEviction` → `index.Evict`），与真实事件是否到达**无关**。
+
+`eventDedupFilter` 也不参与这件事：它的作用域是 `{podIdentifier, deviceTier, groupIdx, dataParallelRank} × blockHash`（`event_dedup_filter.go:52-70`），只对引擎上报的 `BlockStored` / `BlockRemoved` 做引用计数，从不接触 speculative 条目。
 
 注意 `index.Add(ctx, nil, promptKeys, ...)` 的第一个参数是 `nil`——就是 §3.1 注释里说的「speculative 条目没有 engine key」。
 
@@ -870,7 +874,10 @@ func isPrefixIndexableSpecKind(kind KVCacheSpecKind) bool {
 
 **Sliding window attention、Mamba 等混合架构（HMA）跳过索引**。原因：这些架构的 KV 状态不是「前缀决定的」——滑动窗口只保留最近 N 个 token，前缀相同不代表状态可复用。
 
-**实际影响**：部署 Mistral（sliding window）或 Jamba（Mamba 混合）这类模型时，**精确前缀缓存路由完全不生效**，事件被静默跳过。配了一堆参数却没有效果，这是首要排查项。
+**实际影响**：部署 Mistral（sliding window）这类**纯 SWA** 模型时，精确前缀缓存路由基本不生效。但有两个重要限定：
+
+- **跳过不是静默的**，有专门的计数器和结构化日志（`pool.go:584-594`）：指标 `kv_cache_events_stores_skipped_total{cache_kind, reason}`，移除侧是 `kv_cache_events_removals_skipped_total`。**这是排查该问题最直接的手段**。
+- **跳过是有条件的**：只有事件携带了 group 信息才做 spec-kind 判定（`pool.go:70-76`，`ev.GroupIdx == nil` 时直接放行）。所以 Jamba 这类混合架构（HMA）是**部分失效**——只跳过不可索引的那些 group，`full_attention` group 的事件照常入索引。
 
 ### 8.4 AllBlocksCleared 的 tier 局限
 
@@ -937,7 +944,9 @@ T=0.15s  vLLM D3 算完 prefill，存了 block
            用 Tokens 重算 → requestKeys = [R1..R130]  ← 与读路径同一算法，必然对上
            Index.Add([E1..E130], [R1..R130], [{D3, tier:"GPU"}])
              同时建 Eᵢ→Rᵢ 映射（供将来 BlockRemoved 反查）
-           ← 这一步把 T=0 时那批 Speculative 条目换成了引擎确认过的事实
+           ← 注意：这是【新增】一条 {D3, tier:"gpu", Speculative:false} 条目，
+             不会覆盖或删除 T=0 那批 {D3, Speculative:true}——两者是不同的
+             LRU key，会并存到预测条目自己 TTL 到期被 Evict（见 §8.1）
 
 T=1.0s  请求 B 到达（2072 token = S 的 2048 + QB 的 24）
      precise producer:
@@ -1020,7 +1029,7 @@ pkg/kvcache/prefix_match.go:46-58            PodMatch（tier 加权）
 | 用 `precise-prefix-cache-scorer` | 启动日志有 DEPRECATION | 改成 producer + `prefix-cache-scorer` |
 | 共享前缀短于 block size | 命中率 0 | 前缀必须填满完整 block（§9.2 有反例推演） |
 | 近似路线 + 短前缀（<64 token） | 命中率 0 | 换精确路线 |
-| **Sliding window / Mamba 模型** | 事件被静默跳过，配了没用 | 换模型或放弃前缀路由（§8.3） |
+| **Sliding window / Mamba 模型** | 事件被跳过（**有指标**：`kv_cache_events_stores_skipped_total`）；纯 SWA 全失效，HMA 部分失效 | 换模型或放弃前缀路由（§8.3） |
 | 未配 `replaySocketPort` | EPP 重启后索引空，慢慢重建 | 配上，且确认 vLLM 侧开了 ROUTER socket |
 | 多 EPP 副本 + 近似 | 命中率腰斩 | 精确 + Redis 后端 |
 | `HashSeed`/`HashAlgorithm` 各副本不一致（Redis） | 一半副本的 key 另一半查不到 | 所有副本必配同值；改动要清索引 |

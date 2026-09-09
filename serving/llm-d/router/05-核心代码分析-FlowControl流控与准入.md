@@ -41,7 +41,7 @@ flowchart LR
 |------|------|------|
 | `AdmissionController` | Director 的准入入口（接口） | `pkg/epp/requestcontrol/admission.go` |
 | `FlowController` | 同步入口 `EnqueueAndWait`，管请求生命周期 | `flowcontrol/controller/controller.go` |
-| **`Processor`** | **单 goroutine**：入队、dispatch 循环、TTL sweep | `flowcontrol/controller/internal/processor.go` |
+| **`Processor`** | **单 goroutine**：入队 + dispatch 循环（这条路径的唯一写者）。**TTL sweep 另起一个 goroutine**（`processor.go:223-224` 的 `go p.runCleanupSweep`），且会 fan-out 到最多 4 个并发 worker（`maxCleanupWorkers`，`:41-43`） | `flowcontrol/controller/internal/processor.go` |
 | `FlowRegistry` | Flow / priority band / 队列的生命周期与容量统计 | `flowcontrol/registry/registry.go` |
 | `managedQueue` | 装饰 `SafeQueue`，维护 band 与全局统计 | `flowcontrol/registry/managedqueue.go` |
 | `PriorityQueue` | `container/heap`，按 `OrderingPolicy.Less` 排序 | `flowcontrol/queue/priorityqueue.go` |
@@ -183,7 +183,7 @@ func (fcac *FlowControlAdmissionController) Admit(...) error {
 
 这个选择完全由 ext-proc 的形态决定：EPP 是被 Envoy 同步调用的，一个请求对应一个 goroutine。让这个 goroutine 阻塞，**背压天然地传递给 Envoy**（Envoy 的 ext-proc 流卡住 → 上游感知到慢）。如果改成异步回调，还得自己实现一套背压。
 
-代价直接：**排队的请求数 = 阻塞的 goroutine 数**。默认 band 容量 5000 请求 × 多个租户，是实打实的 goroutine 与内存。
+代价直接：**排队的请求数 = 阻塞的 goroutine 数**。但注意 `maxRequests` 是 **band 级的聚合上限、跨该 band 内所有 flow 共享**（`registry_helpers.go:45-47,69-76` 的 `occupancyStats`；准入检查在 `processor.go:385` 拿 band 聚合值比），**不是每个租户各 5000**。所以最坏情况的阻塞 goroutine 数是 `Σ(各 band maxRequests)`，与租户数无关——租户多不会放大总量，而是彼此挤同一个 5000。
 
 ## 3. 错误码映射
 
@@ -222,16 +222,34 @@ func translateFlowControlError(err error, poolEmpty func() bool) error {
 
 汇总（与 01 篇 §3.1 的分界线一致）：
 
-| 情况 | Sentinel | HTTP | drop reason header |
-|------|----------|------|-------------------|
-| 队列满（池里有 endpoint） | `ErrQueueAtCapacity` | **429** | `Saturated` |
-| **TTL 过期，池里有 endpoint** | `ErrTTLExpired` | **429** | `TTLExpired` |
-| **TTL 过期，池是空的** | `ErrTTLExpired` + poolEmpty | **503** | `NoEndpoints` |
-| 池空（scale-to-zero） | `ErrNoEndpoints` | 503 | `NoEndpoints` |
-| 客户端断开 | `ErrContextCancelled` | 503 | `ContextCancelled` |
-| EPP 关停中 | `ErrFlowControllerNotRunning` | 503 | `ShuttingDown` |
+汇总（与 01 篇 §3.1 的分界线一致）。**最后一列是 `x-llm-d-request-dropped-reason` 这个 header 的实际取值**，不是 Go 常量名——照常量名去 grep 会一无所获：
 
-**「同一个 TTL 过期，两个不同状态码」是有意为之**：等超时了但池子有 pod = 忙不过来（客户端应该重试 / 退避）；等超时了池子还是空的 = 服务不可用（客户端应该换个地方或告警）。`poolEmpty` 是**过期那一刻的实时探测**，不是排队开始时的快照。
+| 情况 | Sentinel | HTTP | header 实际值 |
+|------|----------|------|--------------|
+| 队列满（池里有 endpoint） | `ErrQueueAtCapacity` | **429** | `rejected-saturated` |
+| **TTL 过期，池里有 endpoint** | `ErrTTLExpired` | **429** | `rejected-ttl-expired` |
+| **TTL 过期，池是空的** | `ErrTTLExpired` + `ErrNoEndpoints` | **503** | `rejected-no-endpoints` |
+| 池空（scale-to-zero） | `ErrNoEndpoints` | 503 | `rejected-no-endpoints` |
+| 客户端断开 | `ErrContextCancelled` | 503 | `rejected-context-cancelled` |
+| EPP 关停中 | `ErrFlowControllerNotRunning` | 503 | `rejected-shutting-down` |
+
+常量定义在 `pkg/common/error/error.go:30,37-42`。另有 `evicted` / `evicted-queue-pressure` / `evicted-priority` 三个值用于 in-flight 驱逐（§7）。
+
+**「同一个 TTL 过期，两个不同状态码」是有意为之**：等超时了但池子有 pod = 忙不过来（客户端应该重试 / 退避）；等超时了池子还是空的 = 服务不可用（客户端应该换个地方或告警）。
+
+**但分流机制比"实时探测"要绕一层**。空池 regime 下的 sweep 驱逐，错误里**已经带上了 `ErrNoEndpoints`**：
+
+```go
+// pkg/epp/flowcontrol/controller/internal/processor.go:734-739
+func expiryError(poolEmpty bool) error {
+	if poolEmpty {
+		return fmt.Errorf("%w: %w: %w", types.ErrEvicted, types.ErrTTLExpired, types.ErrNoEndpoints)
+	}
+	return fmt.Errorf("%w: %w", types.ErrEvicted, types.ErrTTLExpired)
+}
+```
+
+而 `translateFlowControlError` 的 switch 里 `ErrNoEndpoints` 排在 `ErrTTLExpired` **之前**（`admission.go:261` vs `:270`），所以这条路径**根本不会调用 `poolEmpty()`**。`poolEmpty()` 这个实时探测实际覆盖的是 regime **未**判定为空池的 TTL 过期（比如 `createRequestContext` 的 context backstop 触发的那种，错误里不带 `ErrNoEndpoints`）。源码注释自己交代了这点（`admission.go:248-251`：`poolEmpty is the live probe deciding that split, invoked only when the TTL case is reached`）。**最终状态码结论不变，机制记对就行。**
 
 ## 4. 队列模型
 
@@ -540,7 +558,8 @@ func (d *Detector) Saturation(_ context.Context, candidates []datalayer.Endpoint
 | 模式 | 计算 |
 |------|------|
 | `requests` | `TotalInflight / TotalCapacity` |
-| `tokens` / `hybrid` | per-endpoint `max(reqRatio, tokRatio)` 再平均（`concurrency/detector.go:122-172`） |
+| `tokens` | 与 `requests` 同为**聚合**模式：`TotalTokenInflight / TotalTokenCapacity`（`concurrency/detector.go:164-172`） |
+| `hybrid` | **只有这一档**是 per-endpoint `max(reqRatio, tokRatio)` 再平均（同上，`case modeHybrid`） |
 
 读 03 篇 §6.2 的 `InFlightLoad` attribute。**没有 staleness 概念**（同步计数，EPP 自己记账），因此**不会 fail-closed**。
 
@@ -575,7 +594,7 @@ func (d *Detector) Saturation(_ context.Context, candidates []datalayer.Endpoint
 
 这是刻意的**优先级反转防护**：如果让低优先级请求继续派发，它们会消耗后端资源，加剧高优先级请求面临的饱和——低优先级反而先被服务了。
 
-代价是「head-of-line blocking」：高优先级 band 里有一个请求过不去，全池 dispatch 停摆。**没有滞回（hysteresis）机制**——`headroom` 参数只影响 scheduling 层的 `utilization-filter`（`detector.go:185-212`），不影响这里的门控。所以 saturation 在阈值附近抖动时，dispatch 会跟着抖。
+代价是「head-of-line blocking」：高优先级 band 里有一个请求过不去，全池 dispatch 停摆。**没有滞回（hysteresis）机制**——`headroom` 参数影响的是 `utilization-detector` **自己实现的那个 `Filter` 角色**（`detector.go:185-194`，用 `Threshold × (1 + Headroom)` 的放宽限额剔除单个过载 pod），**不是** §5.1 里那个独立的 `utilization-filter` 插件（`filter/utilization/filter.go:35`，它不吃这个参数）。两者都不影响这里的 HoL 门控。所以 saturation 在阈值附近抖动时，dispatch 会跟着抖。
 
 P/D 场景下取各 stage saturation 的最大值作为 effective（`processor.go:462-484`）。
 
@@ -701,10 +720,21 @@ func IsSheddable(priority int) bool {
 
 | 配置 | 用于 |
 |------|------|
-| `DefaultRequestTTL`（60s） | 池里**有** endpoint 时（真正的饱和排队） |
-| `NoEndpointRequestTTL` | 池里**没有** endpoint 时（scale-from-zero 的等候室） |
+| `DefaultRequestTTL`（默认 60s） | 池里**有** endpoint 时（真正的饱和排队） |
+| `NoEndpointRequestTTL`（默认**也是 60s**） | 池里**没有** endpoint 时（scale-from-zero 的等候室） |
 
-分开的原因：scale-from-zero 场景下，请求要等 WVA/HPA 扩出 pod 再等 pod 就绪，可能需要几十秒到几分钟——比「后端忙」的合理等待时间长得多。这里和 [WVA 的 scale-from-zero](../autoscaling/03-核心代码分析-Optimizer与Limiter.md) 是配套的：**Flow Control 提供等候室，WVA 负责把 pod 拉起来**（WVA 直接改 replicas 的那个唯一例外场景就是它）。
+分开的原因：scale-from-zero 场景下，请求要等 WVA/HPA 扩出 pod 再等 pod 就绪，可能需要几十秒到几分钟——比「后端忙」的合理等待时间长得多。
+
+**但开箱即用**并没有一个更长的冷启动预算：两个默认值**刻意相等**，拆分是 opt-in 的。源码注释讲了为什么（`controller/config.go:34-38`）：
+
+```go
+	// defaultNoEndpointRequestTTL is the queue-wait budget applied while the candidate pool has no endpoints when
+	// neither budget is configured. It is deliberately equal to `defaultRequestTTL`, so splitting the budget is opt-in:
+	// sizing the two regimes apart (a cold start is minutes, a time-to-first-token SLO is seconds) is a
+	// deployment-specific decision, not one a default can make.
+```
+
+而且**只配 `defaultRequestTTL` 时另一个会跟着变**（`config.go:134-142`），想真正分开必须两个都显式写。这里和 [WVA 的 scale-from-zero](../autoscaling/03-核心代码分析-Optimizer与Limiter.md) 是配套的：**Flow Control 提供等候室，WVA 负责把 pod 拉起来**（WVA 直接改 replicas 的那个唯一例外场景就是它）。
 
 ### 9.2 Regime 切换会重置计费起点
 
@@ -719,7 +749,7 @@ func IsSheddable(priority int) bool {
 
 ```go
 // pkg/epp/flowcontrol/controller/controller.go:467-484（节选）
-// max(satTTL, noEndpointTTL) + 2*sweepInterval
+// max(satTTL, noEndpointTTL) + 2*expiryCleanupInterval（默认 1s，即多留 2s）
 ```
 
 请求 context 的 deadline 比 TTL 多留 2 个 sweep 周期，避免「deadline 和 sweep 在同一 tick 触发」的竞态导致双重终结路径打架。
@@ -778,7 +808,7 @@ control plane 通过 `SubmitDesiredPriorities` 推送 band 拓扑（`registry.go
 
 ### 11.3 五个开启后的风险
 
-1. **内存与 goroutine**：默认 band 5000 请求 × 租户数。`maxBytes`（1GB 默认）是真正的闸。
+1. **内存与 goroutine**：默认每个 band 5000 请求（**band 级聚合，不乘租户数**，见 §2.3），总量是 `Σ(各 band maxRequests)`。`maxBytes`（1GB 默认）是真正的闸。
 2. **fail-closed 停摆**：§6.4。必须监控 `stale_endpoints`。想避免可换 `concurrency-detector`。
 3. **60s 固定 TTL** 与客户端 deadline 不匹配（§9.4）。客户端已经超时放弃了，请求还在 EPP 队列里占位。
 4. **`global-strict` 不保证租户公平**（§5.2）。多租户要显式换策略 + 让 FairnessID 有区分度。
@@ -791,28 +821,40 @@ featureGates: ["flowControl"]
 plugins:
   - type: utilization-detector
     parameters:
-      queueDepthThreshold: 8
-      kvCacheUtilThreshold: 0.85
+      queueDepthThreshold: 8               # 默认 5
+      kvCacheUtilThreshold: 0.85           # 默认 0.8
       metricsStalenessThreshold: "500ms"   # 默认 200ms 偏严，容易假饱和
-  - type: fcfs-ordering-policy
   - type: round-robin-fairness-policy      # 多租户不要用默认的 global-strict
-  - type: static-usage-limit-policy
 flowControl:
-  saturationDetector: utilization-detector
+  saturationDetector:
+    pluginRef: utilization-detector        # ← 是结构体，不能直接写字符串
   defaultRequestTTL: "30s"                 # 按客户端超时设，别用 60s 默认
   priorityBands:
     - priority: 10
-      maxRequests: 2000
-      maxBytes: "512Mi"
+      maxRequests: 2000                    # 默认 5000
+      maxBytes: "512Mi"                    # 默认 1GB
+      fairnessPolicyRef: round-robin-fairness-policy   # ← 不写这行策略不会生效
     - priority: 0
       maxRequests: 2000
       maxBytes: "512Mi"
+      fairnessPolicyRef: round-robin-fairness-policy
     - priority: -1                         # 必须显式 provision，否则 fallback 到 0（§10）
       maxRequests: 500
       maxBytes: "128Mi"
+      fairnessPolicyRef: round-robin-fairness-policy
 ```
 
-三个刻意的偏离默认值之处：staleness 放宽到 500ms（降低假饱和概率）、TTL 收紧到 30s（贴近真实客户端超时）、显式 provision 负 band（否则 sheddable 不生效）。
+**这份配置里有两个坑值得单独说，它们都是我第一版写错过的**：
+
+**① `saturationDetector` 是结构体，不是字符串。** 它的类型是 `*SaturationDetectorConfig`，插件名要放在嵌套的 `pluginRef` 里（`apix/config/v1alpha1/endpointpickerconfig_types.go:211-218`）。而顶层配置是**严格解析**的（`configloader.go:269` 用 `serializer.EnableStrict`），直接写 `saturationDetector: utilization-detector` 会 decode 失败、**EPP 启动不起来**。仓库自带的正确写法在 `deploy/config/probabilistic-admitter-epp-config.yaml:22-23`。
+
+**② 在 `plugins:` 里声明 `round-robin-fairness-policy` 并不会启用它。** 公平策略只在 band 显式写了 `fairnessPolicyRef` 时才被覆盖（`config/loader/flowcontrol.go:170-179`）；否则 `ensureFlowControlLayer` 自动注入的 `global-strict-fairness-policy`（`defaults.go:228-232`）会通过 `buildPriorityBandPolicyDefaults` 填进每个未指定的 band。**只声明不引用的结果是：你以为换了策略，实际跑的还是文档反复警告不要用的 global-strict**，而且没有任何提示。
+
+顺带：`fcfs-ordering-policy` 和 `static-usage-limit-policy` 不必声明，`ensureFlowControlLayer`（`defaults.go:222-238`）本来就会自动注入这三个默认策略插件，所以上面把它们删掉了。
+
+**五处刻意偏离默认值**：staleness 放宽到 500ms（默认 200ms，降低假饱和）、TTL 收紧到 30s（默认 60s，贴近客户端超时）、队列阈值 8（默认 5）、KV 阈值 0.85（默认 0.8）、band 容量 2000/512Mi（默认 5000/1GB），外加显式 provision 负 band。
+
+**改 TTL 的一个连带影响**：只配 `defaultRequestTTL` 时，`NoEndpointRequestTTL` 会**跟随**它（`controller/config.go:134-142`），所以这份配置把 scale-from-zero 的"等候室"预算也一起收紧到 30s 了。要分开设就得显式写两个值。
 
 ## 12. 用示例串一遍
 
@@ -821,7 +863,7 @@ D1..D4 全忙（每个队列 12 个请求、KV 78%），请求 A（`FairnessID=t
 ```
 Director 第 ⑥ 步 → FlowControlAdmissionController.Admit(priority=0)
   → EnqueueAndWait
-     ① createRequestContext：deadline = now + 30s(TTL) + 2×sweepInterval
+     ① createRequestContext：deadline = now + 30s(TTL) + 2×1s(expiryCleanupInterval)
      ② WithConnection(FlowKey{ID:"tenant-a", Priority:0})
         → Registry 确保 priorityBands[0].queues["tenant-a"] 存在，pin 住
      ③ Submit(item)
@@ -832,9 +874,9 @@ Director 第 ⑥ 步 → FlowControlAdmissionController.Admit(priority=0)
 Processor dispatch 循环（每 ~1ms）:
   saturation = utilization-detector.Saturation([D1..D4])
     D1: max(12/8, 0.78/0.85) = max(1.50, 0.92) = 1.50
-    D2..D4 类似 → 平均 ≈ 1.48
+    D2..D4 指标相同 → 平均 = 1.50
   ceilings = static-usage-limit-policy → 全 1.0
-  priority 10（空）→ 10 的 ceiling 1.0，saturation 1.48 ≥ 1.0
+  priority 10（空）→ 10 的 ceiling 1.0，saturation 1.50 ≥ 1.0
     → HoL 阻塞，整轮 return false
     → 日志：'Priority band is saturated; enforcing HoL blocking.'
   A 继续在队列里等

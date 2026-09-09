@@ -296,7 +296,7 @@ var defaultEngineConfigs = []engineConfigParams{
 }
 ```
 
-映射表注册在 `mapping_registry.go:28-34`，label 读取在 `extractor.go:230-246`。**没打 label 的 pod fallback 到 `"default"` mapping，默认就是 vllm**（`factories.go:149-150, 244-250`）。
+engine-type 的 label key 常量定义在 `mapping_registry.go:24-35`，**注册逻辑**是同文件的 `Register()`（`:50-65`，实际调用在 `factories.go:234` 与 `:248`），label 读取在 `extractor.go:230-246`。**没打 label 的 pod fallback 到 `"default"` mapping，默认就是 vllm**（`factories.go:149-150, 244-250`）。
 
 #### vLLM ↔ SGLang 的指标名差异
 
@@ -422,10 +422,12 @@ v, ok := fwkdl.ReadAttribute[SomeType](endpoint.GetAttributes(), someKey)
 v, ok := fwksched.ReadRequestAttribute[T](request, key)
 
 // ④ 候选列表（Director 用，不是 scorer）
-pods := datastore.PodList(predicate)   // candidates.go:69-79
+pods := datastore.PodList(predicate)   // Locate() 内，candidates.go:104/110/115/121/151
 ```
 
-**`GetMetrics()` 可能返回 nil**（endpoint 刚创建、还没抓到第一次）。所有 scorer 都必须处理这个分支，这是自定义插件最常见的 panic 来源。
+**`GetMetrics()` 不会返回 nil**——`NewEndpoint` 在 metrics 为 nil 时会补一个空的（`interface/datalayer/endpoint.go:51-58`），而 `runtime.go:420` 创建 endpoint 时传的正是 `nil`。所以"刚创建、还没抓到第一次"的 endpoint 拿到的是**非 nil 的空 `Metrics`**，内置 scorer 全都直接解引用（`queuedepth/queue.go:90`、`loadaware/load_aware.go:88`），没有 nil 判断。
+
+**真正的坑是 `UpdateTime` 为零值**：空 Metrics 的时间戳是零值，会被 staleness 判定为过期，于是这个 endpoint 在 Flow Control 的饱和检测里算「stale」（§8）。写自定义插件时该防的是这个，不是空指针。
 
 ## 5. Endpoint 的发现与生命周期
 
@@ -495,7 +497,7 @@ type DataProducer interface {
 
 Director 按数据依赖 DAG 的顺序调用（排序在 `runner.go:830-831`）。
 
-### 6.1 六个默认 producer 各产出什么
+### 6.1 默认 producer 各产出什么
 
 | type | 文件 | 产出 |
 |------|------|------|
@@ -506,6 +508,8 @@ Director 按数据依赖 DAG 的顺序调用（排序在 `runner.go:830-831`）�
 | `predicted-latency-producer` | `dataproducer/predictedlatency/dataproducer_hooks.go:40-108` | SLO 上下文、前缀分数、在途负载快照，可选写 `LatencyPredictionInfo` |
 | `session-id-producer` | `dataproducer/sessionid/producer.go:107-116` | 从 header / cookie 提取的 session ID |
 | `mm-embeddings-cache-producer` | `dataproducer/multimodal/producer.go:268-294` | 多模态 embedding 的 `EncoderCacheMatchInfo` |
+
+上面七个是常用的。`dataproducer/` 下实际注册的 producer 共 **10 个**，另三个都是 Alpha 或小众：`burst-prefix-cache-producer`（`burstprefix/types.go:28`）、`p2p-source-producer`（`p2psource/producer.go:42`）、`multicluster-approx-prefix-cache-producer`（`approximateprefix/multicluster.go:26`）。
 
 ### 6.2 `inflight-load-producer` 补了 Data Layer 的一个缺口
 
@@ -571,7 +575,7 @@ WVA 侧的对照：WVA 消费的正是 §7.2 这些池级指标，它自己的 a
 | **`llm_d_epp_plugin_duration_seconds`** | `:267-275` |
 | **`llm_d_epp_plugin_data_scope_violations_total`** | `:279-287` |
 
-`plugin_duration_seconds` 按 `{extension_point, type, name}` 分标签，是定位「哪个插件慢」的唯一手段。`data_scope_violations_total` 就是 01 篇 §7 那个静默失败模式的唯一信号。
+`plugin_duration_seconds` 按 `{extension_point, plugin_type, plugin_name}` 分标签（`llm_d_router_metrics.go:276`——**注意是 `plugin_type` / `plugin_name`，不是 `type` / `name`**，写 PromQL 时用后者匹配不到），是定位「哪个插件慢」的唯一手段。`plugin_data_scope_violations_total` 则是 01 篇 §7 那个静默失败模式的唯一信号，它有四个标签 `{extension_point, plugin_type, plugin_name, access}`（`:288`），`access` 区分 read / write。
 
 ### 7.5 Data Layer 自身
 
@@ -663,9 +667,11 @@ NewEndpoint 创建空 Metrics（endpoint.go:56-57），UpdateTime 是零值
 **Flow Control 的队列 gauge 可能出现负数**。看到负值不要以为是采集 bug，是已知的竞态。
 
 ```yaml
-# test/perf/config/router-configs/endpoint-attribute-parity.yaml:186-194（节选）
+# test/perf/config/router-configs/endpoint-attribute-parity.yaml:14-17（注释原文）
 # Why the whole vllm engineConfig is restated: the merge is per engine, not
-# per field — declaring vllm to attach customMetrics suppresses the vllm built-in alone
+# per list (factories.go, newCoreMetricsExtractorPlugin). Each built-in is
+# appended only if its name is absent from engineConfigs, so declaring vllm
+# to attach customMetrics suppresses the vllm built-in alone
 ```
 
 **自定义 engine mapping 时的大坑**：合并粒度是「按 engine 整体」而不是「按字段」。想给 vllm 加一个 customMetric，必须把整个 vllm 配置重写一遍，否则内置的那几条会全部丢失。

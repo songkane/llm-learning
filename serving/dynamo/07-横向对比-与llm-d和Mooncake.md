@@ -168,7 +168,7 @@ Dynamo 这套的好处是「一个中间件都不装也能跑」，坏处是多�
 
 **GAIE 集成**上两者是同一个协议族的不同实现，不共享代码：Dynamo 的 `deploy/inference-gateway/ext-proc/` 与 llm-d EPP 都实现 Gateway API Inference Extension 的 ext_proc 协议。这意味着**理论上可以互换**——但换过去就会丢掉各自的私有能力（Dynamo 会丢精确 token，llm-d 会丢 flow control）。
 
-> 对应 [00 篇 §3](00-总览与架构.md#3-架构的第一刀三个独立的通信平面)、[06 篇](06-部署与Operator.md) ｜ 对照 [llm-d Router 07](../llm-d/router/07-部署示例与端到端Demo.md)
+> 对应 [00 篇 §3](00-总览与架构.md#3-架构的第一刀三个独立的通信平面)、[06 篇](06-部署与Operator.md) ｜ 对照 [llm-d Router 07](../llm-d/router/07-部署配方与排障.md)
 
 ## 8. 四处最值得记住的分歧
 

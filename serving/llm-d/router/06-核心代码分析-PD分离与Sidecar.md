@@ -207,9 +207,11 @@ POST /inference/v1/generate    ┘
 
 **分支 ④ 就是 P/D decider 判定「这个请求不值得分离」的结果**（02 篇 §5.4 的 `prefix-based-pd-decider`）——EPP 不写 prefill header，sidecar 就退化成一个透明代理。
 
+**进分支 ② 之前还有一道硬闸**：开了 `--enable-ssrf-protection` 时，prefill target 不在白名单会**直接返回 403 Forbidden 并 `logger.Error`**（`chat_completions.go:125-141`，日志 `SSRF protection: prefill target not in allowlist`），不降级、不静默、请求直接打死。**这与 encoder 被过滤时的行为正好相反**——encoder 全被拒会退回 P/D 或纯 decode（§5），prefill 被拒则是 403。开了 SSRF 保护后这是最容易踩的坑。
+
 ## 3. NIXLv2：默认的 KV 传输路径
 
-> NIXL 的实现文件是 **`pkg/sidecar/proxy/connector_nixlv2.go`**，`--connector` 的取值是 `nixlv2`。
+> NIXL 的实现文件是 **`pkg/sidecar/proxy/connector_nixlv2.go`**，`--kv-connector` 的取值是 `nixlv2`。
 
 ### 3.1 Prefill 请求的改写
 
@@ -271,7 +273,7 @@ WRITE 的收益是少一个 RTT（不用等 decode 来拉），代价是 prefill
 | 情况 | 行为 | 位置 |
 |------|------|------|
 | prefill 返回非 2xx | 日志 `"prefill request failed"`，返回错误 | `connector_nixlv2.go:251` |
-| prefill 5xx | 按 `--prefill-max-retries` 重试（默认 **0 次**） | `connector_nixlv2.go:209-242` |
+| prefill 5xx | **只有 502 / 503 / 504** 才按 `--prefill-max-retries` 重试（默认 **0 次**）；**500 / 501 明确 fail-fast**，注释说它们「indicate bugs or unsupported operations」（`isRetryableStatus`，`proxy_helpers.go:229-237`） | `connector_nixlv2.go:209-242` |
 | 响应缺 `kv_transfer_params` | 日志 `"warning: missing 'kv_transfer_params' field in prefiller response"` | `connector_nixlv2.go:283` |
 
 **最后一条是排障重点**：这个 warning 说明 vLLM 侧没有正确启用 KV connector（比如启动参数缺 `--kv-transfer-config`）。请求可能还是成功的——但 decode 会自己重算整个 prefill，**P/D 分离等于白配了，只多了一跳网络**。
@@ -361,7 +363,11 @@ LRU 缓存的作用：同一个 prefill host 的 engine map 不会每个请求�
 - NIXL 负责 P/D 之间的 KV 传输
 - Offloading P2P 负责从**第三个 pod**拉取已缓存的前缀
 
-第三个地址由 EPP 通过 `x-kv-cache-source-host-port` 提供（`chat_completions.go:143-162`）。这是 04 篇的精确前缀索引与 06 篇的 KV 传输的会合点：**EPP 从索引里知道「这个前缀在 D7 上」，就让 D3 直接去 D7 拉，而不是让 P1 重算。**
+第三个地址由 EPP 通过 `x-kv-cache-source-host-port` 提供（`chat_completions.go:143-162`）。这是 04 篇的精确前缀索引与 06 篇的 KV 传输的会合点：**EPP 从索引里知道「这个前缀在 D7 上」，于是让 P1 去 D7 拉那段前缀，而不是自己从头重算。**
+
+**注意拉取方是 prefill pod，不是 decode pod。** `remote_kv_source` 被加进的是**prefill 请求体**（`connector_p2p.go:239-253` 的 `addP2PPullToPrefill`，注释原文：`so the prefiller pulls cached prefix from kvCacheSource`），调用点在 prefill 请求发出**之前**（`connector_nixlv2.go:174` 串行路径、`:535` 并行路径）。P1 拉到前缀后继续算剩下的部分，再把完整 KV 交给 D3——**decode pod 全程只从它的 prefiller 拿 KV**。
+
+只有在**没有 prefiller** 的分支 ③ 才是 decode 自己去拉（`decodeWithP2PSource`，`connector_p2p.go:337-373`，注入本地 decoder 的 body）。
 
 约束：`--enable-p2p-pull` 只能配 `nixlv2`，配其他 connector 启动失败（`options.go:663-665`）。
 
@@ -371,7 +377,15 @@ LRU 缓存的作用：同一个 prefill host 的 engine map 不会每个请求�
 // pkg/sidecar/proxy/chat_completions.go:146-158（节选）
 ```
 
-`x-kv-cache-source-host-port` 格式不对、或当前 connector 不支持 P2P，**静默忽略**这个 header，走正常 P/D。没有报错、没有 warning。这是 [07 篇 §3 静默失效总表](07-部署示例与端到端Demo.md#3-静默失效模式总表)上的一条。
+`x-kv-cache-source-host-port` 被忽略有三种原因，**只有第一种是真的静默**（`chat_completions.go:145-159`）：
+
+| 原因 | 日志级别 | grep 什么 |
+|------|---------|----------|
+| 当前 connector 不支持 P2P pull | **DEBUG**（默认看不到） | `ignoring KV cache source header: connector does not support P2P pulls` |
+| **header 格式不合法** | **Info（默认可见）** | `ignoring malformed KV cache source header` |
+| **SSRF 白名单拒绝** | **Info（默认可见）** | `SSRF protection: KV cache source not in allowlist, ignoring` |
+
+三种情况都只是把 `kvCacheSource` 置空、退回正常 P/D，请求不会失败。所以**排查前两类不要放弃看日志**——格式错和 SSRF 拒绝都有明确的 Info 级记录。
 
 ## 5. E/P/D：Encode 分离
 
@@ -412,7 +426,7 @@ LRU 缓存的作用：同一个 prefill host 的 engine map 不会每个请求�
 
 ### 5.3 EPP 侧怎么配
 
-需要 `disagg-profile-handler` 配三个 profile（`deploy/config/sim-e-p-d-epp-config.yaml` 是完整示例）：
+需要三段 `schedulingProfiles`（`deploy/config/sim-e-p-d-epp-config.yaml` 是完整示例）。注意该文件里的 `disagg-profile-handler` **只写了 `deciders`**——下面这段 `profiles:` 是我为了讲清映射关系补的，实际**有默认值** `encode`/`prefill`/`decode`（`disagg_profile_handler.go:176-184`），照抄文件的话这三行是冗余的：
 
 ```yaml
 - type: disagg-profile-handler
@@ -491,10 +505,12 @@ DP rank 的选择方式因 connector 而异：
 
 | Connector | 选 rank 的方式 |
 |-----------|--------------|
-| NIXL / MoRI-IO | `blake2s(requestID) mod dpSize`（`dp_rank.go:26-44`） |
+| **仅 MoRI-IO**（`--moriio-dp-size > 1`） | `blake2s(requestID) mod dpSize`（`dp_rank.go:26-44`） |
 | Mooncake | 从 bootstrap 返回的 engine map 里随机选（`connector_mooncake.go:72-76`） |
 
-**用 requestID hash 而不是随机**：同一个请求在重试时会落到同一个 rank，KV 可能还在。
+**这个哈希与 `--data-parallel-size` 无关**，入参是 `--moriio-dp-size`（默认 1），且只在它 > 1 时才写 header（`connector_nixlv2.go:103-106`）。源码明确划界：「DP-rank propagation is a MoRI-IO WRITE-mode concern only. In standard NIXLv2 READ mode the decode body's remote_dp_rank / remote_dp_rank_override and the x-data-parallel-rank header are left untouched」（`:325-329`）。所以一个普通 `--data-parallel-size=8` 的 NIXLv2 部署**完全不走这个哈希**，rank 是靠端口确定的（多端口克隆 + `p2pPortFor` 端口反推）。
+
+**用 requestID hash 而不是随机的真实理由**，源码注释给的是另一个（`dp_rank.go:26-31`）：dpSize > 1 时 vLLM 的多个 API server 靠 `SO_REUSEPORT` 共享端口，内核可能把同一个 disagg 请求对的**两条腿分派到不同 rank**，导致 MoRI-IO 握手时对端根本没在 listen。把两条腿钉到同一 rank 是为了解决这个，不是为了"重试时复用 KV"。
 
 Wide-EP（跨节点专家并行）靠 MoRI-IO 的 `--moriio-remote-hosts`、`--moriio-dp-size-local` 等（`options.go:317-334`、`connector_nixlv2.go:148-161`）。
 
@@ -695,9 +711,10 @@ DP rank r:          sidecar 8000+r → vLLM 8200+r
 | 现象 | 症状 | 检查 |
 |------|------|------|
 | vLLM 未启用 KV connector | 日志 `warning: missing 'kv_transfer_params'` | vLLM 的 `--kv-transfer-config` |
-| `x-kv-cache-source-host-port` 格式错 | 无任何日志 | `chat_completions.go:146-158` |
+| `x-kv-cache-source-host-port` 格式错 / SSRF 拒绝 | **有 Info 级日志**：`ignoring malformed KV cache source header`、`KV cache source not in allowlist`（只有"connector 不支持 P2P"那种是 DEBUG，见 §4.4） | `chat_completions.go:145-159` |
 | encoder 全被 SSRF 过滤 | 日志 `SSRF protection: all encoder targets filtered out` | `--inference-pool` 的 allowlist |
-| Mooncake engine map 缓存脏 | 502 Bad Gateway | 重启 sidecar 或 prefill pod |
+| Mooncake engine map **查询失败**（连不上 bootstrap / 解析失败 / 空 map） | 502 Bad Gateway + `failed to query mooncake engine ID` | 查 bootstrap 端口连通性 |
+| Mooncake engine map **缓存脏**（LRU 命中过期 engine_id） | **无报错、无 502**，表现为 Mooncake 侧传输失败 | 重启 sidecar 或 prefill pod |
 | chunked decode 输出重复/断裂 | 输出里有多余角色标记 | chat template 与 `continue_final_message` 兼容性 |
 
 ### 三条必记
