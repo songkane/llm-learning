@@ -33,7 +33,8 @@ flowchart LR
 上游文档把 Data Layer 描述为 `Source → Extract → Attribute`。但**「Attribute」不是第三个接口**，它是存储层。实际只有两类插件接口：
 
 ```go
-// pkg/epp/framework/interface/datalayer/plugin.go:29-84（节选）
+// pkg/epp/framework/interface/datalayer/plugin.go:31-84（节选）
+// NotificationSource 另在 :103-114，EndpointSource 在 :122-128
 type DataSource interface {
 	plugin.Plugin
 }
@@ -208,9 +209,10 @@ for _, srcCfg := range cfg.Sources {
 			r.pollingInterval = iv
 		}
 	}
-	if r.pollingInterval < defaultRefreshInterval {
-		r.pollingInterval = defaultRefreshInterval
-	}
+}
+// clamp 在循环【之外】，只做一次（runtime.go:113-115）
+if r.pollingInterval < defaultRefreshInterval {
+	r.pollingInterval = defaultRefreshInterval
 }
 ```
 
@@ -760,7 +762,7 @@ kubectl exec deploy/epp -- curl -s localhost:9090/metrics | grep plugin_duration
 ### 关键文件
 
 ```
-pkg/epp/framework/interface/datalayer/plugin.go:29-84         source/extractor 接口
+pkg/epp/framework/interface/datalayer/plugin.go:31-128        source/extractor/notification 接口
 pkg/epp/datalayer/collector.go:115-141                        采集主循环
 pkg/epp/datalayer/interval_dispatcher.go:58-73                interval → tick 折算
 pkg/epp/datalayer/runtime.go:104-174                          基准 tick 下调 + wiring
