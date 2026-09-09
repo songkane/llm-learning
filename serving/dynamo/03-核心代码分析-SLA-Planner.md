@@ -74,59 +74,13 @@ async def start_planner(runtime: DistributedRuntime, config: PlannerConfig):
 
 **两个环可以同时跑，快环细调、慢环托底**（但注意 §0 的默认值：负载环默认是关的）。§4 讲它们怎么合并。
 
-### 1.3 弹性扩缩容全景：从一个指标到一个 Pod
+### 1.3 本篇的边界：算式 vs 流水线
 
-后面几节会把这条链拆开讲，先给一张完整的图，免得读到中途丢失方位。**Dynamo 的副本弹性扩缩容是一条七段链**：
+副本数从「一个指标」到「一个 Pod」是一条七段链：**采集 → 预测建模 → 求副本数 → 合并约束 → 仲裁 → 下发 → 生效**。
 
-```mermaid
-flowchart TB
-    subgraph S1["① 采集"]
-        A1["worker 引擎<br/>ForwardPassMetrics(FPM)"]
-        A2["Frontend / Router<br/>请求数、ISL/OSL、KV 命中率"]
-        A3["operator<br/>当前 GPU shape、副本数"]
-    end
-    subgraph S2["② 预测与建模"]
-        B1["LoadPredictor<br/>arima(默认) / constant / kalman / prophet<br/>→ 下一区间的 ISL/OSL/rate"]
-        B2["PlannerEnginePerfModel<br/>离线 profile 曲线 + 在线 FPM 回归"]
-    end
-    subgraph S3["③ 求副本数"]
-        C1["慢环 throughput（180s）<br/>容量搜索 → ceil(需求rps ÷ 单副本rps)"]
-        C2["快环 load（5s）<br/>估 TTFT/ITL 与 SLA 比 → ±1"]
-    end
-    subgraph S4["④ 约束与合并"]
-        D1["max(load, throughput 下界)"]
-        D2["min_endpoint 下限"]
-        D3["单次变化幅度 cap<br/>max_throughput_scaling_replicas"]
-        D4["GPU 预算比例 clamp<br/>proportional_clamp_pair"]
-    end
-    subgraph S5["⑤ 仲裁（可选）"]
-        E1["Global Planner<br/>跨 DGD 的 GPU 总预算裁决"]
-    end
-    subgraph S6["⑥ 下发"]
-        F1["DGD ready 门禁"]
-        F2["DGDSA scale 子资源<br/>（HPA/KEDA 同一入口）"]
-        F3["404 兜底：直接 patch DGD"]
-    end
-    subgraph S7["⑦ 生效"]
-        G1["DGD controller → DCD<br/>→ Deployment / LWS → Pod"]
-    end
-    A1 & A2 & A3 --> B1 & B2
-    B1 --> C1
-    B2 --> C1 & C2
-    C1 & C2 --> D1 --> D2 --> D3 --> D4 --> E1 --> F1 --> F2 --> G1
-    F2 -.-> F3 --> G1
-```
+**本篇只讲第 2~3 段**（预测建模、求副本数），也就是「这个数是多少」。控制环怎么驱动、五阶段插件管道、约束链的四道 clamp、下发的三道安全阀、DGDSA 怎么变成 Pod、以及排障链——全部在 **[07 · 弹性扩缩容实现逻辑](07-弹性扩缩容实现逻辑.md)**。
 
-**六个必须先建立的认知：**
-
-| # | 认知 | 为什么重要 |
-|---|---|---|
-| 1 | **扩缩的对象是 DGD 里某个 component 的 `replicas`**，不是 Pod、也不是 GPU | 一个副本可能是「一台 8 卡机」（TP=8 的 recipe 就是 `replicas: 1` + `gpu: "8"`），Planner 算出的副本数要乘以这个系数才是 GPU 消耗，见 [06 篇 §5](06-部署与Operator.md#5-recipes开箱配置) |
-| 2 | **prefill 池和 decode 池是分开算、合并下发的** | 单侧超扩会把 GPU 预算吃光，§5 |
-| 3 | **Planner 不是 K8s controller，是 DGD 里一个普通 Python 组件** | 它自己也在发现平面里注册了 endpoint（§1），Global Planner 靠这个和它对话 |
-| 4 | **Planner 不直接改 Deployment**，只改 DGDSA / DGD | 与 HPA/KEDA 共用 scale 接口，§6 |
-| 5 | **两条判据体系并存**：性能模型（`sla`）与静态阈值（easy mode） | 默认是后者，§4.1 |
-| 6 | **扩容比缩容激进，缩容比扩容谨慎** | 扩容 `any` / 缩容 `all`（easy）、扩容 `all>SLA` / 缩容要过 consolidation 预演（sla），§4.3 |
+一句话分工：**本篇是算式，07 篇是流水线。** 「算出来了但没生效」去看 07。
 
 **判断指标一共三类**，凑起来才是一次完整决策的输入：
 
@@ -154,15 +108,16 @@ flowchart TB
 
 > **一个反直觉但很重要的点**：`request_rate` 只喂给慢环，快环**完全不看 rps**。快环看的是「引擎现在积压成什么样、按这个积压算出来的延迟破没破 SLA」。这就是为什么快环能应对突发——突发流量还没体现在速率统计里，队列已经涨起来了。
 
-**防振荡机制一共五道**，理解它们才能解释「为什么该扩没扩 / 该缩没缩」：
+**防振荡机制一共六道**，理解它们才能解释「为什么该扩没扩 / 该缩没缩」。本篇只负责其中两道（属于「算式」范畴），其余四道在 [07 篇 §9](07-弹性扩缩容实现逻辑.md#9-防振荡六道机制)：
 
-| 机制 | 位置 | 作用 |
+| 机制 | 位置 | 归属 |
 |---|---|---|
-| 慢环下界托底 | `core/load_scaling.py:102`、`:203` | 快环不能把副本压到慢环认为的安全线以下 |
-| 单次变化幅度 cap | `core/throughput_scaling.py:37` | 一次最多改 `max_throughput_scaling_replicas`（默认 8）个 |
-| consolidation 预演 | `core/load_scaling.py:419` 起 | 缩容前先预测「少一台之后会不会立刻违约」（§4.3） |
-| 冷启动观测门槛 | `load_min_observations = 5` | 观测不足直接不决策 |
-| **DGD ready 门禁** | `connectors/kubernetes.py:919` | 上一轮 Pod 没起来就不叠加下一轮（§6.1） |
+| 冷启动观测门槛（`load_min_observations = 5`） | `core/load_scaling.py:427` | **本篇** |
+| consolidation 预演（缩容前预测「少一台会不会违约」） | `core/load_scaling.py:419` 起 | **本篇 §4.3** |
+| 回归模型单调性校验 | `core/perf_model/base.py:205` | 本篇 §3.1 |
+| 慢环下界托底 | `core/load_scaling.py:102`、`:203` | 本篇 §4.2 |
+| 单次变化幅度 cap | `core/throughput_scaling.py:37` | 07 篇 §6.2 |
+| DGD ready 门禁 | `connectors/kubernetes.py:919` | 07 篇 §7.4 |
 
 注意这里**没有传统意义的 cooldown 计时器**。Dynamo 用的是「模型预演 + ready 门禁」这套，比固定冷却窗口更贴合负载，但也意味着**当 DGD 长期处于 not-ready（比如 GPU 不够 Pod 一直 Pending）时，扩缩容会整体停摆**——这是运维上要盯的第一号异常。
 
@@ -400,55 +355,29 @@ P/D 分离下 prefill 和 decode 是两个池，各自算完就直接执行会�
 Planner 的做法（`core/throughput_scaling.py:113~178` `_throughput_disagg`）：
 
 1. **两侧都得算成功**。任一侧 `model_not_ready`，**整个 tick 放弃**（`:127`）——宁可不动，不做半边决策。另一侧会被标成 `partner_not_ready` 以便区分「自己算不出来」和「被拖累」。
-2. **各自 cap 单次变化幅度**（`:136~137` → `_cap_throughput_replicas`，`:37`）：`bounded = clamp(desired, current − limit, current + limit)`，`limit = max_throughput_scaling_replicas`，默认 **8**（`config/defaults.py:30`）。被截断时会打 `Throughput target capped for ...` 的 warning。
+2. **各自 cap 单次变化幅度**（`:136~137`）→ 详见 [07 篇 §6.2](07-弹性扩缩容实现逻辑.md#62-单次变化幅度-cap)。
 3. **先抬到 `min_endpoint` 再做预算 clamp**（`:140~141`）——运行时把 `min_endpoint` 调大必须立刻生效，不能被上一条的变化幅度上限压住。
 4. `_fit_disagg_throughput_ceiling()`（`core/state_machine.py:496`）+ `_apply_disagg_scaling_budget()`（`:553`）做 GPU 预算的**联合 clamp**，数学在 `core/budget.py:93` 的 `proportional_clamp_pair` —— 预算不够时**按比例缩**两边，而不是先到先得。预算参数默认 `max_gpu_budget = 8`、`min_gpu_budget = -1`（禁用下限）。
 5. 最后**一次性**产出 `ScalingDecision(num_prefill=…, num_decode=…)`（或按 §4.2 只写下界）。
 
 快环同样走一遍这套 clamp（`core/load_scaling.py:127~276`），最后也只发一个合并的决策。
 
+> GPU 预算之外还有一道**功耗预算**的 ceiling clamp，且冲突时赢过 GPU 下限——见 [07 篇 §6.4](07-弹性扩缩容实现逻辑.md#64-功耗预算的-ceiling-clamp)。
+
 ## 6. 决策怎么落到 K8s
 
-这是「副本数」变成「Pod」的那一段，跨了 Python Planner 和 Go Operator 两侧。
-
-### 6.1 Planner 侧：一次决策的下发路径
+这一段（Planner 下发路径 → DGDSA → DGD → Deployment/LWS → Pod，以及下发前的三道安全阀）属于「流水线」而非「算式」，完整内容在 **[07 篇 §7~§8](07-弹性扩缩容实现逻辑.md#7-下发三道安全阀)**。这里只留结论：
 
 ```
-ScalingDecision(num_prefill=3, num_decode=5)
-  → core/base.py            _apply_scaling_targets()
-  → connectors/kubernetes.py:910   KubernetesConnector.set_component_replicas([TargetReplica, ...])
-        ├── :917 先 get_graph_deployment() 读回当前 DGD
-        ├── :919 **is_deployment_ready() 检查**——DGD 不 ready 就拒绝/忽略这次扩缩
-        └── 逐个组件比较 current vs desired，只对有变化的调
-  → connectors/clients/kubernetes_api.py:119   update_service_replicas()
-        ├── 优先：patch_namespaced_custom_object_scale 打到
-        │        DynamoGraphDeploymentScalingAdapter（DGDSA）的 **scale 子资源**
-        │        （CR 名 = `<dgd>-<component 小写>`，:132）
-        └── 404 兜底：_update_dgd_replicas() 直接 JSON-patch DGD.spec.components[].replicas
+ScalingDecision
+  → connectors/kubernetes.py:910  set_component_replicas()   ← DGD ready 门禁
+  → connectors/clients/kubernetes_api.py:119                  ← 优先打 DGDSA 的 scale 子资源
+  → operator reconcile                                        → Deployment / LWS → Pod
 ```
 
-第二步的 ready 门禁很关键：**上一轮扩容的 Pod 还没起来时，不会叠加下一轮扩容**。这是最外层的一道防振荡，比任何 cooldown 参数都直接。`raise_not_ready` 决定它是抛异常还是静默跳过。
+**优先走 DGDSA 的 scale 子资源**，因此 HPA / KEDA 与 Planner 共用同一入口、不抢 `replicas` 字段；启用 ScalingAdapter 后 webhook 会禁止直接改 DGD 的 replicas。
 
-### 6.2 Operator 侧：DGDSA 怎么把数字变成 Pod
-
-```
-DGDSA.spec.replicas 被改
-  → DynamoGraphDeploymentScalingAdapterReconciler.Reconcile
-     （deploy/operator/internal/controller/dynamographdeploymentscalingadapter_controller.go:60）
-  → :108 读出目标 DGD 里该 component 当前 replicas
-  → :114 不一致就 :116 写 component.Replicas = &adapter.Spec.Replicas，更新 DGD
-  → :140 回写 adapter.Status.Replicas（scale 子资源的 status）
-  → DGD controller 被 DGD 变更唤醒（:194 findAdaptersForDGD 建立双向 watch）
-  → 展开成 DynamoComponentDeployment → Deployment / LeaderWorkerSet → Pod
-```
-
-**DGDSA 是一层刻意加的间接**。它带来三件事：
-
-1. **实现了 K8s 标准的 `scale` 子资源接口**，所以 `kubectl scale`、**HPA、KEDA 都能操作同一个对象**——Planner 和标准 K8s 自动扩缩容器走同一个入口，不会互相覆盖。
-2. **`scale` 子资源需要一个 `selector`**，`buildPodSelector`（`:152`）负责生成，HPA 靠它找到 Pod 采指标。
-3. 启用了 ScalingAdapter 的 component，operator 的 webhook 会**禁止用户直接改 DGD 里的 replicas**（`shared_v1beta1.go:670`），把所有权收归到 Scale 接口上——避免「人手 `kubectl edit` 改了 replicas，下一个 tick 又被 Planner 改回去」的拉锯。
-
-> 排查扩缩容没生效时，按这条链自上而下看：**Planner 日志有没有 `Prefill: X rps / Y = N` → DGDSA 的 `spec.replicas` 变了没 → DGD 的 component replicas 变了没 → Deployment 的 replicas 变了没 → Pod 是不是 Pending（GPU 不够）**。五段里断在哪一段，问题域完全不同。
+排障链（五段式）见 [07 篇 §10.3](07-弹性扩缩容实现逻辑.md#103-五段式排障链)。
 
 ## 7. Local Planner vs Global Planner
 
@@ -530,12 +459,12 @@ sequenceDiagram
 7. **性能曲线三种来源**（worker 自报 / AIC 仿真 / 真机 profile），换硬件或并行配置后旧曲线作废；在线回归靠**分桶采样**保住全负载区间的样本，靠**单调性校验**拒掉物理上不可能的拟合。
 8. **双环**：慢环 180s 给下界，快环 5s 细调，取 max；**两个环都开时慢环只写下界不下发决策**。
 9. **扩容激进、缩容谨慎**：easy mode 扩用 OR 缩用 AND；SLA 模式扩要 `all > SLA`，缩要过 consolidation 预演（`N/(N-1)` 重新预测 + `sensitivity` 余量 + decode 侧的硬缓存可行性检查）。
-10. **P/D 联合扩缩靠 GPU 预算的比例 clamp**，任一侧算不出来就整 tick 放弃；单次变化幅度还有 `max_throughput_scaling_replicas` 上限。
-11. **落地优先走 DGDSA 的 Scale 子资源**，与 HPA/KEDA 共用入口，避免抢 replicas 字段；下发前还有一道 **DGD ready 门禁**——Dynamo 没有传统 cooldown，靠的是这个。
+10. **P/D 联合扩缩靠 GPU 预算的比例 clamp**，任一侧算不出来就整 tick 放弃；之上还有单次幅度上限与功耗预算（[07 篇 §6](07-弹性扩缩容实现逻辑.md#6-约束链四道-clamp)）。
+11. **落地优先走 DGDSA 的 Scale 子资源**，与 HPA/KEDA 共用入口，避免抢 replicas 字段；完整下发与生效链路见 [07 篇](07-弹性扩缩容实现逻辑.md)。
 12. **DGDR 的「仿真 vs 真机」由 profiler 内部按 `searchStrategy` 决定**，不是 operator 分支（`isOnlineProfiling()` 恒 true 是个陷阱）。
 13. **扩缩的单位是 component 的 replicas，不是 GPU**——TP=8 的部署一个副本就是一台整机，副本数要乘并行度才是 GPU 消耗。
 
 ---
 
 > **上一篇** [02 · KV-aware Router](02-核心代码分析-KV感知路由.md) ｜ **下一篇** [04 · KVBM](04-核心代码分析-KVBM分层KV管理.md)
-> **横向对比**见 [07 · 与 llm-d / Mooncake 的横向对比](07-横向对比-与llm-d和Mooncake.md)
+> **配套**：[07 · 弹性扩缩容实现逻辑](07-弹性扩缩容实现逻辑.md)（本篇是算式，07 篇是流水线）｜ [08 · 与 llm-d WVA 的方法对比](08-扩缩容方法对比-与llm-d-WVA.md)

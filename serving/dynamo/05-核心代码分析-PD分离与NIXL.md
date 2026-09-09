@@ -298,4 +298,3 @@ dbdaf5d699 feat(vllm): add Python sidecar launcher (#13923)
 ---
 
 > **上一篇** [04 · KVBM](04-核心代码分析-KVBM分层KV管理.md) ｜ **下一篇** [06 · 部署与 Operator](06-部署与Operator.md)
-> **横向对比**见 [07 · 与 llm-d / Mooncake 的横向对比](07-横向对比-与llm-d和Mooncake.md)

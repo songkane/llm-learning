@@ -200,4 +200,3 @@ KVBM 的整个设计压在一个前提上：**KV 留在产生它的实例里，�
 ---
 
 > **上一篇** [03 · SLA Planner](03-核心代码分析-SLA-Planner.md) ｜ **下一篇** [05 · P/D 分离与 NIXL](05-核心代码分析-PD分离与NIXL.md)
-> **横向对比**见 [07 · 与 llm-d / Mooncake 的横向对比](07-横向对比-与llm-d和Mooncake.md)

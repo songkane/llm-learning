@@ -18,31 +18,40 @@ Router、Planner、KVBM 在同一个仓库里共享发现、消息面和部署�
 
 ## 学习路线
 
-**00~06 只讲 Dynamo 自身的代码**，跨项目的对比集中在 07 篇。统一示例沿用本仓库的 A/B 共享前缀请求，加上 P/D 分离的 worker 池（prefill `P1/P2` + decode `D1/D2/D3`），角色命名与其余几套笔记一致。
+**00~07 讲 Dynamo 自身的代码**，08 篇是唯一的跨项目对比（且只比扩缩容这一个维度）。统一示例沿用本仓库的 A/B 共享前缀请求，加上 P/D 分离的 worker 池（prefill `P1/P2` + decode `D1/D2/D3`），角色命名与其余几套笔记一致。
 
 | 篇 | 主题 | 核心问题 |
 |----|------|---------|
 | [00](00-总览与架构.md) | 总览与架构 | 整仓地图、**三个独立通信平面**、四级寻址、请求的九步 |
 | [01](01-请求的一生-主控制流.md) | 请求的一生 | Frontend 装配线、模型怎么被发现、**双向回环 pipeline**、TCP call-home |
 | [02](02-核心代码分析-KV感知路由.md) | KV-aware Router | **打分公式（overlap 作减法）**、radix 索引、事件 vs 预测、conditional disagg、插件三段式 |
-| [03](03-核心代码分析-SLA-Planner.md) | SLA Planner | **TTFT/ITL 作为容量搜索的约束**、弹性扩缩容全景（七段链 / 三类指标 / 五道防振荡）、双环扩缩、P/D 预算 clamp、DGDSA 落地、DGDR 零配置 |
+| [03](03-核心代码分析-SLA-Planner.md) | SLA Planner（**算式**） | **TTFT/ITL 作为容量搜索的约束**、双环判据、在线回归、P/D 预算 clamp、DGDR 零配置 |
 | [04](04-核心代码分析-KVBM分层KV管理.md) | KVBM | G1~G4 分层、Leader/Worker 分工、offload 流水线、块的身份 |
 | [05](05-核心代码分析-PD分离与NIXL.md) | P/D 分离与 NIXL | **pull（NIXL）vs push（Mooncake）两种交接语义**、三后端差异、sidecar、E/P/D |
 | [06](06-部署与Operator.md) | 部署与 Operator | 六个 CRD、DGD reconcile、**EndpointSlice × CR 的 join 式发现**、GAIE |
-| [07](07-横向对比-与llm-d和Mooncake.md) | **横向对比** | 与 [llm-d](../llm-d/) / [Mooncake](../../kvcache/mooncake/) 的四处结构性分歧 |
+| [07](07-弹性扩缩容实现逻辑.md) | **弹性扩缩容实现逻辑**（**流水线**） | 控制环 tick、**五阶段插件管道**、类型化提案合并、约束链四道 clamp、下发三道安全阀、DGDSA 生效、六道防振荡、排障链 |
+| [08](08-扩缩容方法对比-与llm-d-WVA.md) | **扩缩容方法对比** | 与 [llm-d WVA](../llm-d/autoscaling/) 的正推 vs 倒推：单副本容量来源、SLA 进入方式、防抖动、多信号融合、异构机型 |
 
-### 横向对比在最后一篇
+### 扩缩容为什么占两篇
 
-[07 · 横向对比](07-横向对比-与llm-d和Mooncake.md) 集中回答「Dynamo 和 llm-d / Mooncake 差在哪」，四个落点：
+**03 是算式，07 是流水线**——这是刻意的切分：
 
-| 问题 | Dynamo | 对面 |
+| | 03 篇 | 07 篇 |
+|---|---|---|
+| 回答 | 副本数**是多少** | 这个数**怎么流动** |
+| 内容 | 容量搜索、性能模型、双环判据 | tick 循环、插件管道、约束链、下发与生效 |
+| 用途 | 「TTFT 200ms 该开几个副本」 | 「算出来了但没生效」 |
+
+08 篇则回答「这套方法和 llm-d WVA 比，各自的代价是什么」，四条主要分歧：
+
+| 问题 | Dynamo Planner | llm-d WVA |
 |------|--------|------|
-| 路由器在不在数据通路上 | **在**（Frontend 兼做 tokenize，路由拿得到精确 token） | llm-d EPP 只答「发给谁」，不碰 token |
-| 打分怎么算 | **统一 cost 函数**，overlap 从 prefill 工作量里减掉，全部项单位是 block | llm-d 多 scorer 加权求和，无量纲 |
-| 副本数怎么定 | **性能模型正推**：SLA 是容量搜索的约束（`optimization_target: sla`；默认档是静态阈值） | WVA 用 token 供需双阈值倒推 |
-| KV 怎么共享 | **留在实例里点对点搬**（NIXL RDMA） | Mooncake 抽进集群级共享池 |
+| 方法论 | **正推**：单副本容量 → 副本数 | **倒推**：供需比 → 缺口 |
+| 单副本容量来源 | 性能模型（需前置 profile，**可外推**） | 当前观测（免前置，含义随工况变） |
+| SLA 怎么进入 | **直接**：TTFT/ITL 是搜索约束 | 间接：0.85/0.70 阈值隐含延迟 |
+| 防抖动 | **模型预演** + ready 门禁，无死区无 cooldown | **静态死区** + pending 的刻意不对称 |
 
-这四条不是独立选择，而是从第一条派生出来的一条链——07 篇 §8 展开这个推导。
+> ⚠️ 注意 08 篇 §4 那条提醒：Dynamo 的**默认档是静态阈值 easy mode**，这一档其实和 WVA 同类；SLA 主线要显式配 `optimization_target: sla`。
 
 ## 复现
 

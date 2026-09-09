@@ -23,7 +23,7 @@
 | 项目 | 目录 | 源码基线 | 定位 |
 |------|------|---------|------|
 | llm-d Router | [`serving/llm-d/router/`](../serving/llm-d/router/) | `main @ 90a28bc` | 懂 LLM 成本结构的 L7 路由（Envoy ext-proc / EPP） |
-| NVIDIA Dynamo Router | [`serving/dynamo/`](../serving/dynamo/02-核心代码分析-KV感知路由.md) | `main @ 946acce` | 单仓服务栈里的 KV-aware 路由：打分各项单位统一为 block 数、overlap 从 prefill 工作量里**减掉**；与 llm-d Router 的加权求和对比见 [07 篇 §2](../serving/dynamo/07-横向对比-与llm-d和Mooncake.md#2-打分减法-vs-加权求和) |
+| NVIDIA Dynamo Router | [`serving/dynamo/`](../serving/dynamo/02-核心代码分析-KV感知路由.md) | `main @ 946acce` | 单仓服务栈里的 KV-aware 路由：打分各项单位统一为 block 数、overlap 从 prefill 工作量里**减掉**（与 llm-d Router 的加权求和是两种取向） |
 
 > **副本数该是多少**见 [`autoscaling/`](../autoscaling/) 索引（正文同样在 `serving/`）。三者的分工：**Scaler 决定「该有几个副本」，Router 决定「这个请求发给哪个副本」，kube-scheduler / Volcano 决定「副本落到哪个节点」。**
 

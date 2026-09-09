@@ -9,17 +9,21 @@ LLM 语义的扩缩容正文按**项目**收在 [`serving/`](../serving/)（和�
 | 项目 | 正文位置 | 源码基线 | 定位 |
 |------|---------|---------|------|
 | llm-d WVA | [`serving/llm-d/autoscaling/`](../serving/llm-d/autoscaling/) | `release-0.9 @ d5d5864` | token 供需双阈值、异构机型、P/D 联合扩容；产出 `wva_desired_replicas` 给 HPA/KEDA |
-| NVIDIA Dynamo Planner | [`serving/dynamo/`](../serving/dynamo/03-核心代码分析-SLA-Planner.md) | `main @ 946acce` | SLA（TTFT / ITL）作为**容量搜索的约束**而非阈值：在 batch size 上搜满足 SLA 且 rps 最大的配置，再 `ceil(需求 rps ÷ 单副本 rps)`。慢环给下界 + 快环按在线回归估延迟做细调，落到 DGDSA 的 scale 子资源。与 WVA 的供需比倒推是两套方法论，对比见 [07 篇 §4](../serving/dynamo/07-横向对比-与llm-d和Mooncake.md#4-副本数正推-vs-倒推) |
+| NVIDIA Dynamo Planner | [算式：`serving/dynamo/03`](../serving/dynamo/03-核心代码分析-SLA-Planner.md) ｜ [流水线：`serving/dynamo/07`](../serving/dynamo/07-弹性扩缩容实现逻辑.md) | `main @ 946acce` | SLA（TTFT / ITL）作为**容量搜索的约束**而非阈值：在 batch size 上搜满足 SLA 且 rps 最大的配置，再 `ceil(需求 rps ÷ 单副本 rps)`。慢环给下界 + 快环按在线回归估延迟做细调，经五阶段插件管道合并约束后落到 DGDSA 的 scale 子资源 |
 
-**两者的方法论差异一张表**（详见各自正文）：
+**两者的方法论差异**：完整对比见 [Dynamo 08 篇](../serving/dynamo/08-扩缩容方法对比-与llm-d-WVA.md)，摘要如下。
 
 | | llm-d WVA | Dynamo Planner |
 |---|---|---|
+| 方法论 | **倒推**：供需比 → 缺口 | **正推**：单副本容量 → 副本数 |
 | 核心量 | KV token 供需比 | 单副本容量（rps） |
-| 是否需要预先 profile | 不需要 | SLA 档需要；默认的 easy mode 档不需要 |
-| 防振荡 | 双阈值**死区**（静态） | 缩容前 **consolidation 预演**（模型预测）+ 下发前 **ready 门禁** |
+| 单副本容量来源 | 当前观测（免前置，含义随工况变） | 性能模型（需前置 profile，**可外推**） |
+| SLA 怎么进入 | 间接（0.85/0.70 阈值隐含延迟） | **直接**（TTFT/ITL 是搜索约束）；但默认档是静态阈值 |
+| 防抖动 | **静态死区** + pending 的刻意不对称 | **模型预演**（`N/(N-1)`）+ ready 门禁，无死区无 cooldown |
+| 多信号融合 | analyzer 投票（any-up / all-down） | 类型化合并（SET / AT_LEAST / AT_MOST） |
+| 异构机型 | **一等公民**（cost-aware 择优） | 无此概念 |
 | 谁改 replicas | 不改，出指标给 HPA/KEDA | 自己改，但改的是 **DGDSA 的 scale 子资源**（HPA 也能改的同一入口） |
-| 0 副本唤醒 | 内建一等公民 | 允许配 0，但零副本时无 FPM 信号，唤醒靠外部组件 |
+| 0 副本唤醒 | 内建一等公民（能看到网关队列） | 允许配 0，但零副本时无 FPM 信号，唤醒靠外部组件 |
 
 > 更多扩缩容方案（HPA/KEDA 自身机制、Knative、各家 serverless 推理）将持续补充，笔记会直接落在本分类下。
 

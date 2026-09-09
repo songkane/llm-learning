@@ -62,9 +62,9 @@
 
 > **WVA 决定「该有几个副本」，Router 决定「这个请求发给哪个副本」**。两者互不依赖，建议先读 Router —— WVA 的容量模型建立在对 KV token 供需的理解上，读过 Router 的 Data Layer（03 篇）会更顺。
 
-- [**NVIDIA Dynamo 源码学习**](serving/dynamo/) —— 与 llm-d 同层的另一套服务栈（NVIDIA，Rust 核心 + Python 扩展）。单仓覆盖 Frontend、Router、Planner、KVBM、Operator：**三个可独立换传输的通信平面**（discovery / request / event，1.x 起 etcd 与 NATS 都不再必需）、**双向回环的 pipeline 算子链**（路由决策在 tokenize 之后，所以拿得到精确 token）、**overlap 作减法的打分公式**（各项单位统一为 block 数，命中即减免 prefill 工作量）、**SLA 驱动的容量搜索**（TTFT/ITL 是 batch size 搜索的约束而非阈值）、**KVBM 的 G1~G4 分层**（leader 只认 hash、worker 只搬字节）、**pull vs push 两种 KV 交接语义**，以及 **EndpointSlice × CR join 式的 K8s 原生发现**。
+- [**NVIDIA Dynamo 源码学习**](serving/dynamo/) —— 与 llm-d 同层的另一套服务栈（NVIDIA，Rust 核心 + Python 扩展）。单仓覆盖 Frontend、Router、Planner、KVBM、Operator：**三个可独立换传输的通信平面**（discovery / request / event，1.x 起 etcd 与 NATS 都不再必需）、**双向回环的 pipeline 算子链**（路由决策在 tokenize 之后，所以拿得到精确 token）、**overlap 作减法的打分公式**（各项单位统一为 block 数，命中即减免 prefill 工作量）、**SLA 驱动的容量搜索**（TTFT/ITL 是 batch size 搜索的约束而非阈值）、**弹性扩缩容的五阶段插件管道**（类型化提案合并 + 四道约束 clamp + 三道下发安全阀）、**KVBM 的 G1~G4 分层**（leader 只认 hash、worker 只搬字节）、**pull vs push 两种 KV 交接语义**，以及 **EndpointSlice × CR join 式的 K8s 原生发现**。
 
-> Dynamo 与 llm-d 是同层的两种取舍，四处分歧最值得对读：**路由器在不在数据通路上**（Dynamo 的 Frontend 兼做 tokenize，llm-d 的 EPP 不碰 token）、**打分是减法还是加权和**、**副本数是性能模型正推还是供需比倒推**、**KV 是留在实例里点对点搬还是抽进共享池**。这些对比集中在 [07 · 横向对比](serving/dynamo/07-横向对比-与llm-d和Mooncake.md) 一篇里，00~06 只讲 Dynamo 自身。
+> Dynamo 与 llm-d 是同层的两种取舍。扩缩容这一维度的完整对比在 [08 · 扩缩容方法对比](serving/dynamo/08-扩缩容方法对比-与llm-d-WVA.md)：**正推（单副本容量 → 副本数）vs 倒推（供需比 → 缺口）**、单副本容量是**性能模型**给的还是**当前观测**推的、SLA 是**直接约束**还是**隐含在阈值里**、防抖动靠**模型预演**还是**静态死区**。其余维度（路由是否在数据通路上、打分是减法还是加权和、KV 是否抽进共享池）散见于各篇正文。
 
 ### 弹性扩缩容（问题域索引）
 
