@@ -28,7 +28,7 @@ KVBM 正从 `lib/llm/src/block_manager/` 拆成七个独立 crate。拆分的依
 
 ## 1. 四层：G1 到 G4
 
-```13:27:lib/kvbm-common/src/lib.rs
+```14:29:lib/kvbm-common/src/lib.rs
 /// KVBM manages G1, G2 and G3 layouts directly. G4 is managed by an external service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LogicalLayoutHandle {
@@ -128,7 +128,7 @@ PolicyEvaluator → PreconditionAwaiter → Batcher → TransferExecutor
 
 ### 3.1 Offload 策略
 
-```18:23:lib/kvbm-engine/src/offload/policy.rs
+```19:23:lib/kvbm-engine/src/offload/policy.rs
 //! - `PresenceFilter<Src, Dst>`: Skip blocks already present in destination tier
 //! - `PresenceAndLFUFilter<Src, Dst>`: Presence check + LFU count threshold
 //! - `PassAllPolicy`: No filtering (pass all blocks)
@@ -138,11 +138,11 @@ PolicyEvaluator → PreconditionAwaiter → Batcher → TransferExecutor
 
 淘汰用的是 **LFU（按访问频次）**，不是 LRU。对 KV 前缀缓存这是更合理的选择：**一个被反复命中的系统提示前缀，即使最近一次访问稍早，也比一个刚用过一次的长尾请求前缀更值得留**。
 
-策略实现里有个值得学的 Rust 技巧（`policy.rs:9~16` 注释）：不用 `#[async_trait]`，而是返回 `Either<Ready<T>, BoxFuture<T>>`。`PresenceFilter` 这类纯本地同步判断走 `Either::Left(ready(...))`，**零堆分配**；只有真需要异步的策略才 `Box::pin`。offload 判定是每块都要跑一遍的热路径，这个优化有意义。
+策略实现里有个值得学的 Rust 技巧（`policy.rs:9~15` 注释）：不用 `#[async_trait]`，而是返回 `Either<Ready<T>, BoxFuture<T>>`。`PresenceFilter` 这类纯本地同步判断走 `Either::Left(ready(...))`，**零堆分配**；只有真需要异步的策略才 `Box::pin`。offload 判定是每块都要跑一遍的热路径，这个优化有意义。
 
 ## 4. 块的身份
 
-```6:7:lib/kvbm-common/src/lib.rs
+```7:8:lib/kvbm-common/src/lib.rs
 pub type BlockId = usize;
 pub type SequenceHash = dynamo_tokens::PositionalLineageHash;
 ```
@@ -159,7 +159,7 @@ pub type SequenceHash = dynamo_tokens::PositionalLineageHash;
 "kv_connector_module_path": "kvbm.vllm_integration.connector"
 ```
 
-Rust 实现在 `lib/bindings/kvbm/src/block_manager/vllm/connector/worker.rs`：注册 vLLM 的 KV tensor、交换 NIXL 元数据。多 connector 场景用 Dynamo 的 `PdConnector` 包一层（`args.py:578`）。
+Rust 实现在 `lib/bindings/kvbm/src/block_manager/vllm/connector/worker.rs`：注册 vLLM 的 KV tensor、交换 NIXL 元数据。多 connector 场景用 Dynamo 的 `PdConnector` 包一层（`args.py:580`，把 kvbm 与 P/D connector 一起塞进 `kv_connector_extra_config.connectors`）。
 
 **SGLang**：`components/src/dynamo/sglang/` 下**搜不到 kvbm**。SGLang 侧目前只做 KV 事件发布（供 02 篇的 Router 用），没有 vLLM 那种 connector 接入。这与官方 README 的特性矩阵一致——KVBM 那一行 SGLang 是 🚧。
 

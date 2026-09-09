@@ -38,10 +38,10 @@ sequenceDiagram
 
 | 行 | 动作 |
 |---|---|
-| `:387` | 把请求标记为 prefill 阶段 |
-| `:391` | **`max_tokens = 1`** |
-| `:427` | `select_and_dispatch_prefill()`——选 prefill worker 并发出去 |
-| `:565` | `next.generate(decode_req)`——把改造过的请求交给 decode router |
+| `:302` | 存下原始 `max_tokens`（回程恢复给 decode 用） |
+| `:392` | **`prefill_req.stop_conditions.max_tokens = Some(1)`** |
+| `:428` | `select_and_dispatch_prefill()`——选 prefill worker 并发出去 |
+| `:555`、`:565` | 还原 `max_tokens` 后 `next.generate(decode_req)`——把改造过的请求交给 decode router |
 
 回来的结果分两种形态（`:530`、`:537`）：
 
@@ -58,7 +58,7 @@ PrefillOutcome::Completed   // vLLM 风格：prefill_result.disaggregated_params
 
 `components/src/dynamo/vllm/kv_connector_protocols.py` 开头的文档字符串把问题说得很清楚：
 
-```5:12:components/src/dynamo/vllm/kv_connector_protocols.py
+```6:13:components/src/dynamo/vllm/kv_connector_protocols.py
 vLLM's KV connectors disagree on the shape of ``kv_transfer_params``:
 NIXL is pull-based (decode reads block locations from the prefill
 response), Mooncake is push-based (prefill pushes blocks under a
@@ -70,7 +70,7 @@ entry.
 
 抽象出来就两个方法：
 
-```29:38:components/src/dynamo/vllm/kv_connector_protocols.py
+```31:40:components/src/dynamo/vllm/kv_connector_protocols.py
     @abstractmethod
     def prefill_request_kv_transfer_params(self) -> Dict[str, Any]:
         """``kv_transfer_params`` for the prefill request to vLLM."""
@@ -86,7 +86,7 @@ entry.
 
 ### 2.1 NIXL：拉
 
-```42:58:components/src/dynamo/vllm/kv_connector_protocols.py
+```43:60:components/src/dynamo/vllm/kv_connector_protocols.py
 class NixlConnectorProtocol(KvConnectorProtocol):
     """Pull-based: decode-side params come straight off the engine response."""
 
@@ -141,29 +141,29 @@ class NixlConnectorProtocol(KvConnectorProtocol):
 
 ## 3. 两侧 handler 里发生了什么
 
-**Prefill 侧**（`components/src/dynamo/vllm/handlers.py:3936` `_generate_token_mode`）：
+**Prefill 侧**（`components/src/dynamo/vllm/handlers.py:3936` `PrefillWorkerHandler._generate_token_mode`）：
 
 ```
-:3969   make_kv_connector_protocol(vllm_config)          按配置选 NIXL / Mooncake
-:3972   _update_kv_transfer_params(sampling_params, 
-            kv_protocol.prefill_request_kv_transfer_params())
+:3973   _update_kv_transfer_params(sampling_params,
+            kv_protocol.prefill_request_kv_transfer_params())     ← :3969 make_kv_connector_protocol
 :3977   sampling_params.max_tokens = 1
 :4005   engine_client.generate(...)
-:4043   kv_protocol.decode_request_kv_transfer_params(res)   从响应导出 decode 侧参数
+:4044   kv_protocol.decode_request_kv_transfer_params(res)         从响应导出 decode 侧参数
 :4041   yield disaggregated_params
 ```
 
-**Decode 侧**（`handlers.py:3556`）：
+**Decode 侧**（`handlers.py:3556` `DecodeWorkerHandler._generate_token_mode`）：
 
 ```
-:3558   从 request["prefill_result"]["disaggregated_params"]["kv_transfer_params"] 取出
-:3659   _update_kv_transfer_params(sampling_params, kv_params)
-:3686   deferred abort ← 见下
+:3565   disaggregated_params = prefill_result.get("disaggregated_params") or {}
+:3566   kv_params = disaggregated_params.get("kv_transfer_params")
+:3660   _update_kv_transfer_params(sampling_params, kv_params)
+:3692   async with _deferred_abort_guard(...)   ← 见下
 ```
 
 ### 3.1 Deferred abort：一个非常实在的坑
 
-`handlers.py:3686` 那段**延迟 abort 到首 token 之后**。
+`handlers.py:176` 的 `_DeferredAbort` 与 `:318` 的 `_deferred_abort_guard` 把 **abort 延迟到首 token 之后**。
 
 原因：客户端断连时正常应该立刻 abort 请求释放资源。但 decode 模式下，此刻 NIXL 可能正在往这个 worker 的显存里 RDMA 写 KV。**abort 会把接收缓冲区撤掉，而对端的 RDMA 还在写**——轻则传输失败，重则写进已释放的显存。
 

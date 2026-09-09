@@ -10,6 +10,8 @@
 
 最具决定性的一条设计：**Frontend 自带 HTTP 与 tokenize / detokenize，请求和响应都穿过它**。由此派生出「路由拿得到精确 token」「打分能用统一量纲」「Router 必须兼任 KV 位置索引」这一整条链。
 
+> ⚠️ **两个最容易被误解的默认值**（详见 [03 篇 §0](03-核心代码分析-SLA-Planner.md#0-一句话概括)）：Planner 的 `optimization_target` 默认是 `throughput`（**静态阈值 easy mode**，不是 SLA 性能模型）；`enable_load_scaling` 默认 `False`（**默认只跑 180s 的慢环**）。「装上 Planner 就自动有 SLA 驱动的弹性扩缩容」是错的，两者都要显式打开。
+
 ## 为什么不拆成 router/ 和 planner/ 两个目录
 
 Router、Planner、KVBM 在同一个仓库里共享发现、消息面和部署模型，拆开会把「一条请求怎么从 Frontend 走到 Worker、指标又怎么回到 Planner」写断。相关索引另见 [`scheduling/`](../../scheduling/) 与 [`autoscaling/`](../../autoscaling/)。
@@ -23,7 +25,7 @@ Router、Planner、KVBM 在同一个仓库里共享发现、消息面和部署�
 | [00](00-总览与架构.md) | 总览与架构 | 整仓地图、**三个独立通信平面**、四级寻址、请求的九步 |
 | [01](01-请求的一生-主控制流.md) | 请求的一生 | Frontend 装配线、模型怎么被发现、**双向回环 pipeline**、TCP call-home |
 | [02](02-核心代码分析-KV感知路由.md) | KV-aware Router | **打分公式（overlap 作减法）**、radix 索引、事件 vs 预测、conditional disagg、插件三段式 |
-| [03](03-核心代码分析-SLA-Planner.md) | SLA Planner | **TTFT/ITL 作为容量搜索的约束**、双环扩缩、P/D 预算 clamp、DGDR 零配置 |
+| [03](03-核心代码分析-SLA-Planner.md) | SLA Planner | **TTFT/ITL 作为容量搜索的约束**、弹性扩缩容全景（七段链 / 三类指标 / 五道防振荡）、双环扩缩、P/D 预算 clamp、DGDSA 落地、DGDR 零配置 |
 | [04](04-核心代码分析-KVBM分层KV管理.md) | KVBM | G1~G4 分层、Leader/Worker 分工、offload 流水线、块的身份 |
 | [05](05-核心代码分析-PD分离与NIXL.md) | P/D 分离与 NIXL | **pull（NIXL）vs push（Mooncake）两种交接语义**、三后端差异、sidecar、E/P/D |
 | [06](06-部署与Operator.md) | 部署与 Operator | 六个 CRD、DGD reconcile、**EndpointSlice × CR 的 join 式发现**、GAIE |
@@ -37,7 +39,7 @@ Router、Planner、KVBM 在同一个仓库里共享发现、消息面和部署�
 |------|--------|------|
 | 路由器在不在数据通路上 | **在**（Frontend 兼做 tokenize，路由拿得到精确 token） | llm-d EPP 只答「发给谁」，不碰 token |
 | 打分怎么算 | **统一 cost 函数**，overlap 从 prefill 工作量里减掉，全部项单位是 block | llm-d 多 scorer 加权求和，无量纲 |
-| 副本数怎么定 | **性能模型正推**：SLA 是容量搜索的约束 | WVA 用 token 供需双阈值倒推 |
+| 副本数怎么定 | **性能模型正推**：SLA 是容量搜索的约束（`optimization_target: sla`；默认档是静态阈值） | WVA 用 token 供需双阈值倒推 |
 | KV 怎么共享 | **留在实例里点对点搬**（NIXL RDMA） | Mooncake 抽进集群级共享池 |
 
 这四条不是独立选择，而是从第一条派生出来的一条链——07 篇 §8 展开这个推导。

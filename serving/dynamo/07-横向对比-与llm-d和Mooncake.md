@@ -99,19 +99,21 @@ llm-d 的 KV Indexer 也是这两条路。**差别在于 Dynamo 把两者做成�
 | 核心量 | KV token 的**供需比** | 单副本**容量**（rps） |
 | 判据 | 双阈值死区：`demand/0.85` 扩、`demand/0.70` 缩 | `ceil(需求 rps ÷ 单副本 rps)` |
 | 单副本容量从哪来 | 从**当前观测**推 | 从**性能模型**查（离线 profile 或仿真） |
-| 需要预先 profile 吗 | 不需要 | **需要** |
+| 需要预先 profile 吗 | 不需要 | **需要**（但这不是 Dynamo 的默认档，见下） |
 | SLA 怎么进入决策 | 间接（阈值是经验值） | **直接**：TTFT / ITL 是容量搜索的约束条件 |
 | 投机解码 | 不在模型里 | 进了公式：`itl = forward / accept_length` |
+| 缩容判据 | 供需比低于下阈值 | **先预演再决策**：按 `N/(N-1)` 重新预测缩容后的延迟，过了才缩 |
 
 这个差别是结构性的：Dynamo 敢直接拿 TTFT / ITL 当输入，是因为它手上有一条「batch size → 延迟」的性能曲线；WVA 没有，只能用供需阈值近似。**代价是 Dynamo 多了一个前置步骤**——曲线得先搞到手，换硬件或并行配置就作废。
 
-值得注意的是 Dynamo 自己也留了阈值档：`optimization_target` 取 `throughput` / `latency` / `load` 时走 easy mode，不需要 profile。**easy mode 才是和 WVA 同类的做法**，起步阶段用它更现实。
+值得注意的是 Dynamo 自己也留了阈值档，而且**那才是默认档**：`optimization_target` 默认取 `throughput`，走的是 easy mode 静态阈值（prefill 看队列 token / context_length，decode 看 KV 利用率），不需要 profile。SLA 那条主线要显式配 `optimization_target: sla`。**easy mode 才是和 WVA 同类的做法**，起步阶段用它更现实。
 
 两个细分对比：
 
 - **P/D 联合扩缩**：WVA 用 **Δ_util 匹配**（两侧利用率变化量要配得上），Dynamo 用 **GPU 预算的比例 clamp**。前者约束「效果对齐」，后者约束「资源不超发」。
+- **防振荡**：WVA 靠双阈值死区（扩缩阈值之间留一段不动区）；Dynamo 没有死区也没有 cooldown 计时器，靠的是**缩容前的 consolidation 预演**（预测「少一台之后会不会立刻违约」）加上**下发前的 DGD ready 门禁**（上一轮 Pod 没起来就不叠加）。**同一个问题的两种解法：一个用静态死区，一个用模型预测。**
 - **决策怎么落地**：WVA 不自己改副本，产出 `wva_desired_replicas` 指标交给 HPA/KEDA 消费；Dynamo 自己改，但改的是 DGDSA 的 **Scale 子资源**——一个 HPA 也能改的标准接口。**两者是同一个思路的两种实现**：都在避免「两个控制器抢同一个 replicas 字段」。
-- **缩容到零**：WVA 是内建的一等公民（含唤醒路径）；Dynamo 允许你配 `min_endpoint = 0`，但唤醒得靠别的组件（如 ModelExpress 的权重流式加载），不是打磨过的完整路径。
+- **缩容到零**：WVA 是内建的一等公民（含唤醒路径）；Dynamo 允许你配 `min_endpoint = 0`（默认 1），但零副本时连 FPM 都没有，负载环直接返回 `insufficient_data`，唤醒得靠别的组件（如 ModelExpress 的权重流式加载），不是打磨过的完整路径。
 
 > 对应 [03 篇](03-核心代码分析-SLA-Planner.md) ｜ 对照 [llm-d WVA 01](../llm-d/autoscaling/01-核心原理-轮询引擎与双阈值容量模型.md)
 
@@ -168,7 +170,7 @@ Dynamo 这套的好处是「一个中间件都不装也能跑」，坏处是多�
 
 **GAIE 集成**上两者是同一个协议族的不同实现，不共享代码：Dynamo 的 `deploy/inference-gateway/ext-proc/` 与 llm-d EPP 都实现 Gateway API Inference Extension 的 ext_proc 协议。这意味着**理论上可以互换**——但换过去就会丢掉各自的私有能力（Dynamo 会丢精确 token，llm-d 会丢 flow control）。
 
-> 对应 [00 篇 §3](00-总览与架构.md#3-架构的第一刀三个独立的通信平面)、[06 篇](06-部署与Operator.md) ｜ 对照 [llm-d Router 07](../llm-d/router/07-部署配方与排障.md)
+> 对应 [00 篇 §3](00-总览与架构.md#3-架构的第一刀三个独立的通信平面)、[06 篇](06-部署与Operator.md) ｜ 对照 [llm-d Router 07](../llm-d/router/07-部署示例与端到端Demo.md)
 
 ## 8. 四处最值得记住的分歧
 

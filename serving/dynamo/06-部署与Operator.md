@@ -14,11 +14,11 @@
 | Frontend 角色 | 独立 Deployment，集群入口 | **降级成每个 worker pod 里的 sidecar**，`--router-mode direct` |
 | 适合 | 本地开发、单集群、Dynamo 想独占入口 | 平台已标准化在 Gateway API 上，边缘要做鉴权/限流/可观测 |
 
-第二条路径就是 [01 篇 §5.1](01-请求的一生-主控制流.md#51-七种-router-mode) 里 `direct` 模式的用武之地，也是 [01 篇 §1.1](01-请求的一生-主控制流.md#11-三种起法) 强调「Frontend 是库」的意义所在。
+第二条路径就是 [01 篇 §5.1](01-请求的一生-主控制流.md#51-七种-router-mode) 里 `direct` 模式的用武之地，也是 [01 篇 §1.1](01-请求的一生-主控制流.md#11-四种起法) 强调「Frontend 是库」的意义所在。
 
 ## 1. 六个 CRD
 
-Group 统一是 **`nvidia.com`**（`api/v1alpha1/groupversion_info.go:32`），`v1alpha1` 和 `v1beta1` 并存并有 conversion webhook（`api/CONVERSION.md`，还配了 roundtrip fuzz 测试）。
+Group 统一是 **`nvidia.com`**（`api/v1alpha1/groupversion_info.go:33`），`v1alpha1` 和 `v1beta1` 并存并有 conversion webhook（`api/CONVERSION.md`，还配了 roundtrip fuzz 测试）。
 
 ```
 deploy/operator/config/crd/bases/
@@ -43,30 +43,36 @@ deploy/operator/config/crd/bases/
 
 ### 1.1 DGD Spec
 
-```85:93:deploy/operator/api/v1alpha1/dynamographdeployment_types.go
-type DynamoGraphDeploymentSpec struct {
-    Services map[string]*DynamoComponentDeploymentSharedSpec `json:"services,omitempty"`
-    BackendFramework string `json:"backendFramework,omitempty"` // sglang|vllm|trtllm
-    PVCs []PVC `json:"pvcs,omitempty"`
-    Experimental *DynamoGraphDeploymentExperimentalSpec `json:"experimental,omitempty"`
+`deploy/operator/api/v1alpha1/dynamographdeployment_types.go:88` 起，**节选**四个关键字段（原结构体字段远不止这些）：
+
+```go
+type DynamoGraphDeploymentSpec struct {            // :88
+    PVCs             []PVC                                          // :111
+    Services         map[string]*DynamoComponentDeploymentSharedSpec // :115
+    BackendFramework string                                         // :122  sglang|vllm|trtllm
+    Experimental     *DynamoGraphDeploymentExperimentalSpec         // :138
 }
 ```
 
-**`services` 是个 map 而不是 list**，key 就是组件名（`Frontend`、`prefill`、`decode`）。每项带 `componentType`（frontend / worker）和 `subComponentType`（prefill / decode / encode），这两个字段决定 operator 怎么处理它。
+**`services` 是个 map 而不是 list**，key 就是组件名（`Frontend`、`prefill`、`decode`）。每项带 `componentType`（frontend / worker / planner / epp）和 `subComponentType`（prefill / decode / encode），这两个字段决定 operator 怎么处理它。
+
+> **v1alpha1 与 v1beta1 的字段形状不同，别混**：v1alpha1 是 `spec.services`（**map**），v1beta1 改成了 `spec.components`（**list**，`api/v1beta1/dynamographdeployment_types.go:61`，元素自带 `name`）。两版由 conversion webhook 互转；Planner 的 K8s connector 走的是 v1beta1 的 `spec.components`（`connectors/clients/kubernetes_api.py:_dgd_components`），而 `recipes/` 里的示例多数还写 v1alpha1。看到「`spec.services` 还是 `spec.components`」先确认 apiVersion。
 
 ### 1.2 DGDR Spec
 
-```143:150:deploy/operator/api/v1alpha1/dynamographdeploymentrequest_types.go
-type DynamoGraphDeploymentRequestSpec struct {
-    Model string `json:"model"`
-    Backend string `json:"backend"`   // auto|vllm|sglang|trtllm
-    ProfilingConfig ProfilingConfigSpec `json:"profilingConfig"`
-    AutoApply bool `json:"autoApply,omitempty"`
-    DeploymentOverrides *DeploymentOverridesSpec `json:"deploymentOverrides,omitempty"`
+`deploy/operator/api/v1alpha1/dynamographdeploymentrequest_types.go:143` 起，**节选**：
+
+```go
+type DynamoGraphDeploymentRequestSpec struct {   // :143
+    Model               string                   // :148
+    Backend             string                   // :155  auto|vllm|sglang|trtllm
+    ProfilingConfig     ProfilingConfigSpec
+    AutoApply           bool
+    DeploymentOverrides *DeploymentOverridesSpec
 }
 ```
 
-状态机 `Initializing → Pending → Profiling → Deploying → Ready | Failed`（`:97`）。完整链路在 [03 篇 §8](03-核心代码分析-SLA-Planner.md#8-dgdr零配置部署的完整链路) 讲过。
+状态机 `Initializing → Pending → Profiling → Deploying → Ready`，外加 `DeploymentDeleted` 与 `Failed` 两个终态（枚举在 `:97`）。完整链路在 [03 篇 §8](03-核心代码分析-SLA-Planner.md#8-dgdr零配置部署的完整链路) 讲过。
 
 **`autoApply: false` 是个实用的安全阀**：跑完 profiling 生成 DGD spec 但不部署，人看过再手动应用。生产环境第一次用 DGDR 建议这么来。
 
@@ -103,7 +109,7 @@ Grove 那条是给 NVL72 那种需要拓扑感知 gang 调度的场景准备的�
 - **DynamoGraphDeploymentScalingAdapter**
 - 可选 **InferencePool**（GAIE 用）
 
-> **EndpointSlice 不是 operator 建的**。operator 只建 Headless Service，EndpointSlice 由 K8s 自己的 Service controller 生成。注意 `model_service.go:172` 那句 `PublishNotReadyAddresses: false`——**没 ready 的 pod 不出现在 EndpointSlice 里**，这直接决定了 §3 的发现语义。
+> **EndpointSlice 不是 operator 建的**。operator 只建 Headless Service，EndpointSlice 由 K8s 自己的 Service controller 生成。注意 `internal/dynamo/model_service.go:173` 那句 `PublishNotReadyAddresses: false`——**没 ready 的 pod 不出现在 EndpointSlice 里**，这直接决定了 §3 的发现语义。（多节点 LWS 的 leader/follower 内部 Service 反过来设 `true`，见 `internal/dynamo/graph.go:1037`，否则 follower 连不上还没就绪的 leader 会死锁。）
 
 ## 3. K8s 原生服务发现：不用 etcd 的实现
 
@@ -111,10 +117,10 @@ Grove 那条是给 NVL72 那种需要拓扑感知 gang 调度的场景准备的�
 
 ### 3.1 写入侧（worker 进程）
 
-`lib/runtime/src/discovery/kube.rs:235~257`：
+`lib/runtime/src/discovery/kube.rs`：
 
 1. worker 注册 endpoint / model card → 更新进程内的 `DiscoveryMetadata`
-2. `build_cr()` + **`apply_cr()`**（Server-Side Apply）把它写成一个 **`DynamoWorkerMetadata` CR**（`crd.rs:168`）
+2. `build_cr()`（`kube/crd.rs:55`）+ **`apply_cr()`**（`kube/crd.rs:168`，Server-Side Apply）把它写成一个 **`DynamoWorkerMetadata` CR**
 
 ### 3.2 读取侧（discovery daemon）
 
@@ -122,7 +128,7 @@ Grove 那条是给 NVL72 那种需要拓扑感知 gang 调度的场景准备的�
 
 | watch | 位置 | 提供什么 |
 |---|---|---|
-| **EndpointSlice** | `:122`，label selector `nvidia.com/dynamo-discovery-backend=kubernetes` | **谁活着**（readiness + IP） |
+| **EndpointSlice** | `:118` label selector `nvidia.com/dynamo-discovery-backend=kubernetes`，`:123` 起 reflector | **谁活着**（readiness + IP） |
 | **DynamoWorkerMetadata CR** | `:230` | **它是什么**（模型、endpoint、transport、codec） |
 
 然后做 **join**（`daemon/state.rs` 的 join table）：EndpointSlice 的 readiness × CR 的 metadata → `DiscoveryEvent::Added/Removed`。`extract_endpoint_info()`（`kube/utils.rs:98`）从 EndpointSlice 里取 `(instance_id, cr_name, pod_uid)` 作关联键。
@@ -170,9 +176,9 @@ operator 侧对应的动作是建 discovery RBAC（`dgd_discovery_reconciler.go`
 
 > **当前状态**：后端 P/D adapter **部分还是 501 未实现**（README `:34`），decode 直通可用。**GAIE + P/D 分离这个组合现在不完整**，选型时要注意。
 
-## 5. `recipes/`：36 个开箱配置
+## 5. `recipes/`：开箱配置
 
-结构是 `recipes/<模型>/<后端>/<拓扑>/deploy.yaml`。以 `recipes/deepseek-r1/sglang/` 为例：
+结构是 `recipes/<模型>/<后端>/<拓扑>/deploy.yaml`。当前是 **31 个模型目录、138 份 `deploy.yaml`**（数量在涨，以仓库为准）。以 `recipes/deepseek-r1/sglang/` 为例：
 
 ```
 README.md          16×/32× H200，基于 SGLang WideEP
